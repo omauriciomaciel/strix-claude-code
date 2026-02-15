@@ -919,6 +919,7 @@ curl -s -X POST "{sandbox_info["tool_server_url"]}/execute" \\
 exec claude \\
     --mcp-config "{mcp_config_path}" \\
     --append-system-prompt "$(cat "{system_prompt_path}")" \\
+    --allow-dangerously-skip-permissions \\
     --dangerously-skip-permissions \\
     "{wrapper_initial}"
 ''')
@@ -1167,6 +1168,7 @@ START PHASE 1 NOW. Be THOROUGH. Miss NOTHING.
                 "claude",
                 "--mcp-config", str(mcp_config_path),
                 "--append-system-prompt", system_prompt,
+                "--allow-dangerously-skip-permissions",
                 "--dangerously-skip-permissions",
                 initial_prompt,  # Pass prompt as argument
             ], cwd=temp_config_dir)
