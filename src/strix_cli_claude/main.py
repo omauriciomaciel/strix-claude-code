@@ -16,11 +16,28 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from .github_org import fetch_org_repos, parse_org_from_url
+from .github_org import parse_org_from_url
 from .sandbox import Sandbox, SandboxError
 
 console = Console()
 logger = logging.getLogger(__name__)
+
+# Path to the strix guidelines file (CLAUDE.md)
+_STRIX_GUIDELINES_PATH = Path(__file__).parent.parent.parent / ".claude" / "CLAUDE.md"
+
+
+def _load_strix_guidelines() -> str | None:
+    """Load Strix triage guidelines from .claude/CLAUDE.md.
+
+    Searches for the file relative to the package root so it works
+    regardless of the working directory Claude is launched from.
+    """
+    if _STRIX_GUIDELINES_PATH.is_file():
+        try:
+            return _STRIX_GUIDELINES_PATH.read_text(encoding="utf-8").strip()
+        except OSError:
+            logger.warning("Failed to read Strix guidelines from %s", _STRIX_GUIDELINES_PATH)
+    return None
 
 
 def get_system_prompt(targets: str, scan_mode: str, cpu_count: int, instruction: str | None = None, report_file: str | None = None, mount_docker: bool = False) -> str:
@@ -611,6 +628,18 @@ Remember: A single high-impact vulnerability is worth more than dozens of low-se
 Focus on demonstrable business impact. Document everything with create_vulnerability_report.
 """
 
+    # Load triage guidelines from CLAUDE.md if available
+    claude_md = _load_strix_guidelines()
+    if claude_md:
+        base_prompt += f"""
+==============================================================================
+STRIX TRIAGE & REPORTING GUIDELINES (MANDATORY)
+==============================================================================
+Do NOT modify the .claude/CLAUDE.md file unless explicitly instructed by the user.
+
+{claude_md}
+"""
+
     return base_prompt
 
 
@@ -675,6 +704,9 @@ def clone_github_repo(repo_url: str, target_dir: Path) -> Path:
     return clone_path
 
 
+MAX_PARALLEL_AGENTS = 8
+
+
 def _handle_org_scan(
     org_targets: list[dict[str, str]],
     extra_targets: list[str],
@@ -685,106 +717,193 @@ def _handle_org_scan(
     mount_docker: bool,
     verbose: bool,
 ) -> None:
-    """Expand org targets into individual repo scans launched in parallel.
+    """Launch a single Strix sandbox that scans all repos in the org.
 
-    Each repo gets its own screen session via scan_manager.start_scan().
+    Claude inside the sandbox uses the fetch_github_org_repos MCP tool to
+    list repos, clones them via terminal_execute, and runs up to
+    MAX_PARALLEL_AGENTS parallel agents for scanning.
     """
     from datetime import datetime
 
-    from . import scan_manager
+    org_names = [ot["org"] for ot in org_targets]
 
-    all_repos: list[dict] = []
-
-    for org_target in org_targets:
-        org_name = org_target["org"]
-        console.print(Panel(
-            f"[bold]Fetching repos from GitHub org:[/bold] [cyan]{org_name}[/cyan]\n"
-            f"[dim]Skipping: archived, disabled, forked, demo, example, sample, test repos[/dim]",
-            title="Org Scan",
-        ))
-
-        try:
-            with console.status(f"Fetching repos from {org_name}..."):
-                repos = fetch_org_repos(org_name)
-        except ValueError as e:
-            console.print(f"[red]Error:[/red] {e}")
-            sys.exit(1)
-        except Exception as e:
-            console.print(f"[red]Failed to fetch repos:[/red] {e}")
-            if verbose:
-                import traceback
-                traceback.print_exc()
-            sys.exit(1)
-
-        if not repos:
-            console.print(f"[yellow]No repos found for org {org_name} after filtering.[/yellow]")
-            continue
-
-        console.print(f"[green]Found {len(repos)} repos to scan:[/green]")
-        for i, repo in enumerate(repos, 1):
-            lang = repo["language"] or "unknown"
-            console.print(
-                f"  {i:3d}. [cyan]{repo['full_name']}[/cyan]  "
-                f"[dim]({lang}, {repo['stars']}★)[/dim]"
-            )
-
-        all_repos.extend(repos)
-
-    if not all_repos:
-        console.print("[yellow]No repos to scan.[/yellow]")
-        return
-
-    console.print()
-    total = len(all_repos)
     console.print(Panel(
-        f"[bold]Launching {total} parallel scans[/bold]\n"
-        f"[dim]Mode: {scan_mode} | Each repo gets its own sandbox[/dim]",
-        title="Starting Org Scan",
+        f"[bold]Org scan:[/bold] [cyan]{', '.join(org_names)}[/cyan]\n"
+        f"[dim]Claude will fetch repos, clone them inside the sandbox, and scan with up to {MAX_PARALLEL_AGENTS} parallel agents[/dim]",
+        title="Org Scan",
     ))
 
-    launched: list[dict] = []
-    for repo in all_repos:
-        repo_url = repo["clone_url"]
-        repo_name = repo["name"]
+    # Build target descriptions for the system prompt
+    target_descriptions = [f"GitHub org: {name}" for name in org_names]
+    for et in extra_targets:
+        target_descriptions.append(et)
 
-        # Each repo gets its own output file
+    # Set output file
+    if not output_file:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        repo_output = output_file
-        if not repo_output:
-            repo_output = str(Path.cwd() / f"strix_report_{repo_name}_{timestamp}.md")
+        org_label = "_".join(org_names)
+        output_file = str(Path.cwd() / f"strix_report_{org_label}_{timestamp}.md")
+    else:
+        output_file = str(Path(output_file).resolve())
+
+    # Generate scan_id
+    import secrets
+    scan_id = secrets.token_hex(4)
+
+    # Start a single sandbox
+    sandbox: Sandbox | None = None
+    temp_config_dir: str | None = None
+
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Starting Docker sandbox...", total=None)
+            sandbox = Sandbox(image=image, scan_id=scan_id, mount_docker_socket=mount_docker)
+            atexit.register(sandbox.stop)
+            sandbox_info = sandbox.start()
+            progress.update(task, description="Sandbox started!")
+
+        console.print(f"[green]Sandbox ready![/green]")
+        console.print(f"  Container: {sandbox_info['container_name']}")
+        console.print(f"  Tool server: {sandbox_info['tool_server_url']}")
+        console.print(f"  CPUs allocated: {sandbox_info['cpu_count']}")
+
+        # Create MCP config
+        mcp_config = create_mcp_config(
+            sandbox_info["tool_server_url"],
+            sandbox_info["tool_server_token"],
+            sandbox_info["scan_id"],
+            output_file,
+        )
+
+        temp_config_dir = tempfile.mkdtemp(prefix=f"strix-cli-{scan_id}")
+        mcp_config_path = Path(temp_config_dir) / "mcp.json"
+        mcp_config_path.write_text(json.dumps(mcp_config, indent=2))
+
+        # Write tool server credentials for parallel subagents
+        creds_file = Path("/tmp/strix-tool-server.env")
+        creds_file.write_text(f"""STRIX_TOOL_URL={sandbox_info["tool_server_url"]}
+STRIX_TOOL_TOKEN={sandbox_info["tool_server_token"]}
+""")
+        creds_file.chmod(0o600)
+
+        # Create helper script for subagents
+        helper_script = Path("/tmp/strix-tool")
+        helper_script.write_text(f'''#!/bin/bash
+TOOL_NAME="$1"
+TOOL_ARGS="$2"
+curl -s -X POST "{sandbox_info["tool_server_url"]}/execute" \\
+  -H "Authorization: Bearer {sandbox_info["tool_server_token"]}" \\
+  -H "Content-Type: application/json" \\
+  -d "{{\\"tool_name\\": \\"$TOOL_NAME\\", \\"kwargs\\": $TOOL_ARGS, \\"agent_id\\": \\"subagent\\"}}" \\
+  | jq -r '.result.content // .result // .error // "No output"'
+''')
+        helper_script.chmod(0o755)
+
+        # Generate system prompt
+        target_info = "\n".join(target_descriptions)
+        system_prompt = get_system_prompt(target_info, scan_mode, sandbox_info["cpu_count"], instruction, output_file, mount_docker)
+
+        # Write system prompt to file
+        system_prompt_path = Path(temp_config_dir) / "system_prompt.txt"
+        system_prompt_path.write_text(system_prompt)
+
+        org_list_str = ", ".join(org_names)
+        initial_prompt = f"""YOU ARE SCANNING GITHUB ORGANIZATION(S): {org_list_str}
+
+==============================================================================
+PHASE 1: FETCH AND CLONE ALL REPOS (MANDATORY FIRST STEP)
+==============================================================================
+
+STEP 1 — Use the fetch_github_org_repos tool for each org to get the repo list.
+  Orgs to fetch: {org_list_str}
+
+STEP 2 — Clone ALL repos inside the sandbox using terminal_execute:
+  For each repo, run: git clone --depth 1 <clone_url> /workspace/<repo_name>
+
+STEP 3 — Confirm all repos are cloned. List /workspace to verify.
+
+==============================================================================
+PHASE 2: PARALLEL SECURITY SCANNING (MAX {MAX_PARALLEL_AGENTS} AGENTS AT A TIME)
+==============================================================================
+
+CRITICAL RULE: Run at most {MAX_PARALLEL_AGENTS} parallel agents at any time.
+
+For each cloned repo:
+- Spawn an agent to scan that repo (read code, check .github/workflows/, grep for vulns)
+- Each agent scans ONE repo and reports findings
+- Wait for agents to finish before spawning more (keep max {MAX_PARALLEL_AGENTS} active)
+
+Agent instructions per repo:
+1. Read the codebase structure (list_files /workspace/<repo>)
+2. Check .github/workflows/ for GitHub Actions vulnerabilities
+3. Pattern scan for secrets, injection sinks, auth issues
+4. For security-critical repos (auth, crypto, CI/CD): do actual code review
+5. Report findings with create_vulnerability_report
+
+==============================================================================
+PHASE 3: FINAL REPORT
+==============================================================================
+
+After all repos are scanned:
+- Summarize findings across all repos
+- Call finish_scan with a comprehensive executive summary
+
+==============================================================================
+
+START PHASE 1 NOW. Fetch the repos first.
+"""
+
+        console.print("\n[bold]Starting Claude CLI for org scan...[/bold]\n")
+        console.print("=" * 60)
+
+        claude_env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
+        claude_base_args = [
+            "claude",
+            "--mcp-config", str(mcp_config_path),
+            "--append-system-prompt", system_prompt,
+            "--permission-mode", "bypassPermissions",
+            "--dangerously-skip-permissions",
+        ]
+
+        if sys.stdin.isatty():
+            result = subprocess.run(
+                claude_base_args + [initial_prompt],
+                cwd=temp_config_dir,
+                env=claude_env,
+            )
         else:
-            # If user specified an output file, make per-repo variants
-            base = Path(repo_output)
-            repo_output = str(base.parent / f"{base.stem}_{repo_name}{base.suffix}")
-
-        # Build target list: the repo + any extra non-org targets
-        scan_targets = [repo_url] + list(extra_targets)
-
-        try:
-            metadata = scan_manager.start_scan(
-                targets=scan_targets,
-                scan_mode=scan_mode,
-                instruction=instruction,
-                output_file=repo_output,
-                mount_docker=mount_docker,
+            console.print(f"\n[bold yellow]No interactive terminal - running in print mode.[/bold yellow]")
+            result = subprocess.run(
+                claude_base_args + ["--print", initial_prompt],
+                cwd=temp_config_dir,
+                env=claude_env,
             )
-            launched.append({"repo": repo["full_name"], **metadata})
-            console.print(
-                f"  [green]✓[/green] {repo['full_name']} → "
-                f"[dim]scan {metadata['scan_id']}[/dim]"
-            )
-        except Exception as e:
-            console.print(f"  [red]✗[/red] {repo['full_name']}: {e}")
 
-    console.print()
-    console.print(Panel(
-        f"[green bold]Launched {len(launched)}/{total} scans[/green bold]\n\n"
-        f"[dim]Manage scans with:[/dim]\n"
-        f"  [cyan]strix-claude-tui[/cyan]           — TUI dashboard\n"
-        f"  [cyan]screen -list[/cyan]               — list sessions\n"
-        f"  [cyan]screen -x strix-<id>[/cyan]       — attach to scan",
-        title="Org Scan Started",
-    ))
+        console.print("\n" + "=" * 60)
+        console.print("[bold]Org scan session ended.[/bold]")
+
+    except SandboxError as e:
+        console.print(f"[red]Sandbox error:[/red] {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        if verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+    finally:
+        if temp_config_dir and Path(temp_config_dir).exists():
+            shutil.rmtree(temp_config_dir, ignore_errors=True)
+        if sandbox:
+            with console.status("Stopping sandbox..."):
+                sandbox.stop()
+            console.print("[green]Sandbox stopped.[/green]")
 
 
 def classify_target(target: str) -> dict[str, str]:
