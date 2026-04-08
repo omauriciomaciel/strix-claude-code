@@ -815,6 +815,18 @@ curl -s -X POST "{sandbox_info["tool_server_url"]}/execute" \\
         initial_prompt = f"""YOU ARE SCANNING GITHUB ORGANIZATION(S): {org_list_str}
 
 ==============================================================================
+CRITICAL RULE: SCAN ALL REPOSITORIES. SKIP NONE.
+==============================================================================
+
+The ONLY repos that are pre-filtered out are: archived, disabled, forked, demo,
+example, sample, test, template, tutorial, starter, boilerplate, empty, and
+oversized (>2 GB). These are already removed by fetch_github_org_repos.
+
+Every repo returned by fetch_github_org_repos MUST be scanned. Do NOT skip any
+repo for any reason (too many repos, looks uninteresting, low stars, etc.).
+You must scan ALL of them.
+
+==============================================================================
 PHASE 1: FETCH AND CLONE ALL REPOS (MANDATORY FIRST STEP)
 ==============================================================================
 
@@ -827,30 +839,30 @@ STEP 2 — Clone ALL repos inside the sandbox using terminal_execute:
 STEP 3 — Confirm all repos are cloned. List /workspace to verify.
 
 ==============================================================================
-PHASE 2: PARALLEL SECURITY SCANNING (MAX {MAX_PARALLEL_AGENTS} AGENTS AT A TIME)
+PHASE 2: SCAN IN BATCHES OF 10
 ==============================================================================
 
-CRITICAL RULE: Run at most {MAX_PARALLEL_AGENTS} parallel agents at any time.
+Process repos in batches of 10. For each batch:
+1. Spawn up to {MAX_PARALLEL_AGENTS} parallel agents (max {MAX_PARALLEL_AGENTS} active at a time)
+2. Each agent scans ONE repo:
+   - Read the codebase structure (list_files /workspace/<repo>)
+   - Check .github/workflows/ for GitHub Actions vulnerabilities
+   - Pattern scan for secrets, injection sinks, auth issues
+   - For security-critical repos (auth, crypto, CI/CD): do actual code review
+   - Report findings with create_vulnerability_report
+3. Wait for ALL agents in the batch to finish
+4. Move to the next batch of 10
 
-For each cloned repo:
-- Spawn an agent to scan that repo (read code, check .github/workflows/, grep for vulns)
-- Each agent scans ONE repo and reports findings
-- Wait for agents to finish before spawning more (keep max {MAX_PARALLEL_AGENTS} active)
-
-Agent instructions per repo:
-1. Read the codebase structure (list_files /workspace/<repo>)
-2. Check .github/workflows/ for GitHub Actions vulnerabilities
-3. Pattern scan for secrets, injection sinks, auth issues
-4. For security-critical repos (auth, crypto, CI/CD): do actual code review
-5. Report findings with create_vulnerability_report
+Repeat until EVERY repo has been scanned. Do NOT stop early.
 
 ==============================================================================
 PHASE 3: FINAL REPORT
 ==============================================================================
 
-After all repos are scanned:
+After ALL repos are scanned (not before):
 - Summarize findings across all repos
 - Call finish_scan with a comprehensive executive summary
+- State how many repos were scanned out of the total
 
 ==============================================================================
 

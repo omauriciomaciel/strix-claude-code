@@ -532,8 +532,8 @@ ONLY call this when you are completely done with the assessment.""",
         name="fetch_github_org_repos",
         description="""Fetch all scannable repositories from a GitHub organization.
 
-Returns a filtered list of repos (skips archived, disabled, forked, demo/example/sample/test repos).
-Each repo includes: name, full_name, clone_url, html_url, stars, language, description, default_branch.
+Returns a filtered list of repos (skips archived, disabled, forked, demo/example/sample/test repos, and repos exceeding max_size_kb).
+Each repo includes: name, full_name, clone_url, html_url, stars, language, description, default_branch, size_kb.
 
 Use this tool when scanning a GitHub org to get the list of repos to clone and scan.
 After getting the list, clone repos inside the sandbox using terminal_execute with git clone.""",
@@ -548,6 +548,11 @@ After getting the list, clone repos inside the sandbox using terminal_execute wi
                     "type": "boolean",
                     "description": "Include private repos (requires token with appropriate scope)",
                     "default": False,
+                },
+                "max_size_kb": {
+                    "type": "integer",
+                    "description": "Maximum repo size in KB. Repos larger than this are skipped. Default: 2097152 (2 GB)",
+                    "default": 2097152,
                 },
             },
             "required": ["org"],
@@ -1028,13 +1033,14 @@ def create_server() -> Server:
         """Handle fetch_github_org_repos - fetches repos from GitHub org via API."""
         org = arguments.get("org", "").strip()
         include_private = arguments.get("include_private", False)
+        max_size_kb = arguments.get("max_size_kb", 2097152)
 
         if not org:
             return [TextContent(type="text", text="Error: org parameter is required")]
 
         try:
             from .github_org import fetch_org_repos
-            repos = fetch_org_repos(org, include_private=include_private)
+            repos = fetch_org_repos(org, include_private=include_private, max_size_kb=max_size_kb)
 
             if not repos:
                 return [TextContent(type="text", text=f"No repos found for org '{org}' after filtering.")]

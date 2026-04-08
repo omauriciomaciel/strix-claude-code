@@ -28,10 +28,15 @@ def _get_headers() -> dict[str, str]:
     return headers
 
 
+# Default max repo size: 2 GB (GitHub API reports size in KB)
+DEFAULT_MAX_SIZE_KB = 2 * 1024 * 1024
+
+
 def fetch_org_repos(
     org: str,
     *,
     min_stars: int = 0,
+    max_size_kb: int = DEFAULT_MAX_SIZE_KB,
     include_private: bool = False,
 ) -> list[dict[str, Any]]:
     """Fetch all non-archived, non-forked, non-disabled repos from a GitHub org.
@@ -39,11 +44,13 @@ def fetch_org_repos(
     Args:
         org: GitHub organization name.
         min_stars: Minimum stargazer count to include (default 0 = all).
+        max_size_kb: Maximum repo size in KB (default 2 GB). Repos larger than
+            this are skipped to avoid cloning multi-GB repositories.
         include_private: Whether to include private repos (requires token with scope).
 
     Returns:
         List of repo dicts with keys: name, full_name, clone_url, ssh_url,
-        html_url, stars, language, description, default_branch.
+        html_url, stars, language, description, default_branch, size_kb.
     """
     headers = _get_headers()
     all_repos: list[dict[str, Any]] = []
@@ -119,6 +126,13 @@ def fetch_org_repos(
             logger.debug(f"Skipping empty: {full_name}")
             continue
 
+        # Skip repos exceeding max size
+        repo_size_kb = repo.get("size", 0)
+        if max_size_kb and repo_size_kb > max_size_kb:
+            size_mb = repo_size_kb / 1024
+            logger.info(f"Skipping oversized repo ({size_mb:.0f} MB): {full_name}")
+            continue
+
         filtered.append({
             "name": name,
             "full_name": full_name,
@@ -129,6 +143,7 @@ def fetch_org_repos(
             "language": repo.get("language"),
             "description": repo.get("description", ""),
             "default_branch": repo.get("default_branch", "main"),
+            "size_kb": repo_size_kb,
         })
 
     # Sort by stars descending (scan most important repos first)
@@ -137,7 +152,7 @@ def fetch_org_repos(
     logger.info(
         f"Filtered to {len(filtered)} repos "
         f"(skipped {len(all_repos) - len(filtered)}: "
-        f"archived/disabled/forked/demo/example/sample/test/empty)"
+        f"archived/disabled/forked/demo/example/sample/test/empty/oversized)"
     )
 
     return filtered
