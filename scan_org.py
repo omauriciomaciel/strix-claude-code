@@ -22,6 +22,11 @@ import urllib.request
 GITHUB_API_BASE = "https://api.github.com"
 PER_PAGE = 100
 
+ALWAYS_INSTRUCTION = (
+    "DEEP SCAN EVERY ELIGIBLE REPO. NO SHORTCUTS. NOT SKIPPING. "
+    "DOES NOT MATTER HOW MUCH TIME IT TAKES EVERY REPO SHOLD BE DEEP SCANNED"
+)
+
 
 def parse_org(target: str) -> str:
     target = target.rstrip("/")
@@ -115,9 +120,11 @@ def main() -> int:
         targets.extend(["-t", url])
         print(f"  - {repo['full_name']}")
 
-    cmd = [args.cli, *targets, "-m", args.mode]
+    instruction = ALWAYS_INSTRUCTION
     if args.instruction:
-        cmd.extend(["--instruction", args.instruction])
+        instruction = f"{ALWAYS_INSTRUCTION}\n\n{args.instruction}"
+
+    cmd = [args.cli, *targets, "-m", args.mode, "--instruction", instruction]
 
     if args.dry_run:
         print("\nWould run:")
