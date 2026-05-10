@@ -19,7 +19,6 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from .extension_downloader import parse_extension_url
 from .github_org import parse_org_from_url
 from .sandbox import Sandbox, SandboxError
-from .validator import run_validation_pass
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -483,7 +482,24 @@ UPGRADE findings that were underrated but have real external impact.
 
 FINAL REPORT FILTER: Only include findings rated MEDIUM severity or above (CVSS >= 4.0) in the final report. Drop all Low and Informational findings entirely — do not mention them.
 
-Only AFTER this reassessment is complete, proceed to call finish_scan with the refined findings.
+==============================================================================
+MANDATORY INDEPENDENT VALIDATION (BEFORE calling finish_scan)
+==============================================================================
+After your own reassessment, independently re-verify EVERY remaining finding by spawning a fresh subagent with NO context from this session. Pass it only the finding's markdown block from {report_path} and ask it to decide valid vs false-positive using strict external-attacker H1 triage standards. The subagent should end its reply with one line: `VERDICT: VALID — <reason>` or `VERDICT: FALSE_POSITIVE — <reason>`.
+
+Validate findings one at a time, not in parallel. If the verdict is FALSE_POSITIVE, remove the entire `### {{title}} ... ---` block from {report_path} with str_replace_editor before moving to the next finding. Only call finish_scan after every finding has been validated and false positives have been removed.
+
+==============================================================================
+FINAL RESPONSE FORMAT (after finish_scan)
+==============================================================================
+Your final reply to the user must be ONLY:
+
+  Findings: <N>
+  - [SEVERITY] <title>
+  - [SEVERITY] <title>
+  ...
+
+No executive summary, no methodology recap, no recommendations, no narrative, no closing remarks. Just the count and one line per surviving finding. The full report is already in {report_path} — do not repeat it.
 """
 
     # Check if there's local code (whitebox testing)
@@ -747,7 +763,6 @@ def _handle_org_scan(
     image: str | None,
     mount_docker: bool,
     verbose: bool,
-    validate: bool = True,
 ) -> None:
     """Launch a single Strix sandbox that scans all repos in the org.
 
@@ -932,26 +947,6 @@ START PHASE 1 NOW. Fetch the repos first.
         console.print("\n" + "=" * 60)
         console.print("[bold]Org scan session ended.[/bold]")
 
-        if validate:
-            try:
-                log_dir = Path(output_file).parent / f"strix_validator_logs_{scan_id}"
-                run_validation_pass(
-                    report_file=output_file,
-                    mcp_config_path=mcp_config_path,
-                    target_info=target_info,
-                    scan_mode=scan_mode,
-                    cpu_count=sandbox_info["cpu_count"],
-                    log_dir=log_dir,
-                    console=console,
-                )
-            except Exception as e:
-                console.print(f"[red]Validator pass failed:[/red] {e}")
-                if verbose:
-                    import traceback
-                    traceback.print_exc()
-        else:
-            console.print("[dim]Validator pass skipped (--no-validate).[/dim]")
-
     except SandboxError as e:
         console.print(f"[red]Sandbox error:[/red] {e}")
         sys.exit(1)
@@ -1027,7 +1022,6 @@ def classify_target(target: str) -> dict[str, str]:
 @click.option("--mount-docker", is_flag=True, help="Mount Docker socket for container scanning (trivy, docker inspect, etc.)")
 @click.option("--keep-container", is_flag=True, help="Keep container running after scan")
 @click.option("--scan-id", help="Scan ID (used by TUI for tracking)")
-@click.option("--no-validate", is_flag=True, help="Skip the post-scan validator pass that re-checks each finding with a fresh agent")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def main(
     targets: tuple[str, ...],
@@ -1039,7 +1033,6 @@ def main(
     mount_docker: bool,
     keep_container: bool,
     scan_id: str | None,
-    no_validate: bool,
     verbose: bool,
 ):
     """Strix Claude Code - AI-powered penetration testing using Claude CLI.
@@ -1092,7 +1085,6 @@ def main(
             image=image,
             mount_docker=mount_docker,
             verbose=verbose,
-            validate=not no_validate,
         )
         return
 
@@ -1538,16 +1530,13 @@ For each URL above, call the `download_extension` MCP tool with that URL — it 
             "--dangerously-skip-permissions",
         ]
 
-        # Check if we have a TTY for interactive mode
         if sys.stdin.isatty():
-            # Run claude interactively with initial prompt
             result = subprocess.run(
                 claude_base_args + [initial_prompt],
                 cwd=temp_config_dir,
                 env=claude_env,
             )
         else:
-            # No TTY - run in non-interactive print mode
             console.print(f"\n[bold yellow]No interactive terminal - running in print mode.[/bold yellow]")
             result = subprocess.run(
                 claude_base_args + ["--print", initial_prompt],
@@ -1557,26 +1546,6 @@ For each URL above, call the `download_extension` MCP tool with that URL — it 
 
         console.print("\n" + "=" * 60)
         console.print("[bold]Scan session ended.[/bold]")
-
-        if not no_validate:
-            try:
-                log_dir = Path(output_file).parent / f"strix_validator_logs_{scan_id}"
-                run_validation_pass(
-                    report_file=output_file,
-                    mcp_config_path=mcp_config_path,
-                    target_info=target_info,
-                    scan_mode=scan_mode,
-                    cpu_count=sandbox_info["cpu_count"],
-                    log_dir=log_dir,
-                    console=console,
-                )
-            except Exception as e:
-                console.print(f"[red]Validator pass failed:[/red] {e}")
-                if verbose:
-                    import traceback
-                    traceback.print_exc()
-        else:
-            console.print("[dim]Validator pass skipped (--no-validate).[/dim]")
 
         if keep_container:
             console.print(f"\n[yellow]Container kept running:[/yellow] {sandbox_info['container_name']}")
