@@ -1013,7 +1013,7 @@ def classify_target(target: str) -> dict[str, str]:
 
 
 @click.command()
-@click.option("-t", "--target", "targets", required=True, multiple=True, help="Target URL, domain, IP, or local path (can specify multiple)")
+@click.option("-t", "--target", "targets", required=False, multiple=True, help="Target URL, domain, IP, or local path (can specify multiple). If omitted, the agent enters an interactive session and asks for a target.")
 @click.option("-m", "--scan-mode", type=click.Choice(["quick", "standard", "deep"]), default="deep", help="Scan mode")
 @click.option("--instruction", help="Custom instructions for the scan")
 @click.option("--instruction-file", type=click.Path(exists=True), help="File containing custom instructions")
@@ -1155,6 +1155,10 @@ def main(
         else:
             target_descriptions.append(f"Domain/IP: {ct['domain']}")
 
+    interactive_no_target = not classified_targets
+    if interactive_no_target:
+        target_descriptions = ["(no target supplied — interactive mode; agent will ask the user)"]
+
     targets_display = "\n".join(f"  - {td}" for td in target_descriptions)
 
     console.print(Panel(
@@ -1268,7 +1272,18 @@ exec claude \\
         # Check if we have local code targets for whitebox testing
         has_local_code = any(ct["type"] in ("local", "extension") for ct in classified_targets)
 
-        if has_local_code:
+        if interactive_no_target:
+            initial_prompt = """No scan target was supplied on the CLI. This is an interactive session — the user will drive it.
+
+Your first message must be EXACTLY this one line and nothing else:
+
+  What would you like me to scan? (URL, domain, IP, local path, GitHub repo or org, VS Code / Chrome marketplace link.)
+
+Then WAIT for the user's reply. When they answer, classify the target yourself, set up whatever's needed (clone the repo via terminal_execute, call download_extension for marketplace URLs, run recon for URLs/domains, etc.), and run the appropriate phases as described in your system prompt. Honor all the system-prompt rules (Workspace-Trust filter for VS Code, independent validator subagents per finding, FINAL RESPONSE FORMAT, etc.).
+
+The user may also give follow-up instructions, add more targets, or ask questions between scans — handle them in turn. Do NOT start any scan before the user has named a target.
+"""
+        elif has_local_code:
             # Whitebox testing - component discovery first
             initial_prompt = f"""YOU HAVE THE SOURCE CODE. PHASE 1 IS MANDATORY BEFORE ANY TESTING.
 
@@ -1510,12 +1525,67 @@ START PHASE 1 NOW. Be THOROUGH. Miss NOTHING.
         if extension_targets_present:
             ext_lines = [f"  - {ct['url']}" for ct in extension_targets_present]
             ext_summary = "\n".join(ext_lines)
+            has_vscode_target = any(ct.get("kind") == "vscode" for ct in extension_targets_present)
+            vscode_trust_rule = ""
+            if has_vscode_target:
+                vscode_trust_rule = """
+VS CODE WORKSPACE-TRUST RULE — DO NOT SHORT-CIRCUIT, HUNT FOR BYPASSES FIRST:
+Background — three major programs have closed "RCE after trust" as out of scope:
+  - Google Cloud VRP (Cody YOLO): "YOLO mode... can only be used in a trusted workspace... by design."
+  - Shopify (theme-check `require:`): "Code execution via developer-authored config in local development tooling is out of bounty scope... the decision to trust the source of the repository sits with the developer."
+  - Salesforce (salesforcedx java.home): "If the victim trusts the workspace then this is expected behaviour for IDEs since code execution is part of its use."
+
+So the easy "looks trust-gated" path is dead. BUT — do NOT drop the finding the moment you see trust is involved. The same primitive (e.g. `require()` of workspace data, `child_process.exec` of a workspace setting, JSON.parse + eval) is often reachable through OTHER paths that do NOT require trust. The vulnerable code is the same; only the trigger changes. Your job is to interrogate every "trust-gated" candidate for a no-trust trigger BEFORE deciding it is out of scope.
+
+For each candidate finding that appears to need trust, exhaustively check for at least these bypass surfaces — go read the actual manifest and the actual code, do not guess:
+
+1. activationEvents reachable without trust. A few events fire BEFORE the trust prompt or in Restricted Mode:
+   - `onUri` / URI handlers — a `vscode://publisher.ext/...` link clicked in a browser can activate the extension before the user has trusted anything. Read `package.json` activationEvents and the `window.registerUriHandler` callsites.
+   - `onAuthenticationRequest`, `onCustomEditor`, `onWebviewPanel` reopen — can fire from VS Code session restore.
+   - `onLanguage:<id>` for a language the extension handles — an untitled buffer in that language activates it.
+   - `onCommand:<cmd>` if the command is callable from a URI or another extension.
+   - `*` (universal activation) — extension runs in Restricted Mode unless capabilities say otherwise.
+
+2. `capabilities.untrustedWorkspaces` declaration. Read it carefully:
+   - `"supported": true` → the extension claims it is SAFE in Restricted Mode. If any code path in Restricted Mode reaches a sink (require/exec/eval/spawn/child_process), that's a real finding: the extension lied.
+   - `"supported": "limited"` with `restrictedConfigurations: [...]` → only the listed settings are blocked. Any OTHER setting that reaches a sink is in scope.
+   - `"supported": false` and missing — finding fires only after trust. Still check the other bypass surfaces below before dropping.
+
+3. Webview message handlers (`webview.onDidReceiveMessage`). Webviews can be opened pre-trust by some extensions, AND a malicious web page can frame the webview's iframe URL or postMessage to it. If the message handler ends in eval/require/exec, the trigger is web-reachable, not trust-gated.
+
+4. Local TCP/Unix servers and IPC. Some extensions bind a port (language server, debug adapter, telemetry, devtools relay). If the bind is on `0.0.0.0` or accepts unauthenticated requests from `localhost`, an attacker on the network or a malicious page using `fetch('http://127.0.0.1:<port>')` can reach the sink without trust.
+
+5. OAuth / authentication callback handlers. Registered via URI handlers — they fire pre-trust and often parse attacker-controlled redirect-URI params.
+
+6. Auto-update / "download latest binary" code paths that run on activation. The download URL can be poisoned via DNS, a workspace-supplied config, or a previously-cached value.
+
+7. Telemetry / crash-report endpoints in the extension that read workspace data and POST to a configurable URL.
+
+8. Clipboard / notification / quickPick handlers that fire on user actions other than trust.
+
+9. Race condition on the trust prompt. If the extension activates and starts work BEFORE the trust prompt is answered (some extensions short-circuit during startup), the sink may fire in an unrestricted window.
+
+10. Same-publisher chained extensions. If extension A activates without trust (e.g. has correct `untrustedWorkspaces.supported: true`) and calls into vulnerable extension B's API, the bug fires from A's no-trust context.
+
+Decision rule:
+- If ANY of the above gives you a no-trust trigger that reaches the same sink → KEEP the finding, but rewrite the title/PoC to use that trigger, not the trust-gated one. State explicitly which no-trust path you confirmed.
+- If you have read the manifest, the activation code, the URI handlers, the webview handlers, the network servers, and every other applicable surface, AND none of them reach the sink without trust → THEN drop it as trust-gated.
+
+When dropping, log a one-line reason of WHAT bypasses you checked, e.g.:
+  "Dropped: trust required (checked URI handler, webview msg, untrustedWorkspaces=false, no network bind)"
+
+Apply this filter during your reassessment, BEFORE running the independent validator subagents. Keep a count of confirmed trust-gated findings you drop. After finish_scan, append exactly one extra line to your final output:
+
+  Dropped (Workspace Trust / opt-in required): <count>
+
+If zero were dropped, still print the line with `0`.
+"""
             extension_preamble = f"""TASK: download and security-review the listed browser/IDE extension(s):
 
 {ext_summary}
 
 For each URL above, call the `download_extension` MCP tool with that URL — it will fetch the public package (.vsix / .crx) into the sandbox and extract the source under /workspace/<auto-name>. Then list_files on the extracted directory and run the whitebox source-code review against it.
-
+{vscode_trust_rule}
 """
             initial_prompt = extension_preamble + initial_prompt
 
