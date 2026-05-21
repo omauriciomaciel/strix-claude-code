@@ -12,6 +12,12 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+# The MCP server is launched as a script (`python mcp_server.py`), so relative
+# imports fail. The package is installed via `pip install -e .`, so the absolute
+# form works in both script and module contexts.
+from strix_cli_claude import db as _h1_db
+from strix_cli_claude.h1_client import H1Client, H1Error
+
 logger = logging.getLogger(__name__)
 
 # Tool server connection info (set by main.py before starting MCP server)
@@ -588,9 +594,229 @@ After it returns, list_files /workspace/<name> and start your whitebox review. D
 ]
 
 
+# ---------------------------------------------------------------------------
+# HackerOne / scan-queue / findings tools — backed by SQLite at ~/.strix
+# ---------------------------------------------------------------------------
+
+H1_TOOLS = [
+    Tool(
+        name="h1_sync_programs",
+        description=(
+            "Pull all programs and their structured scopes from the HackerOne "
+            "API and upsert into local SQLite. Use once at the start of a "
+            "session (or to refresh). Reads H1_USERNAME and H1_TOKEN from the "
+            "MCP server's environment. Returns counts of programs and targets "
+            "synced."
+        ),
+        inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    Tool(
+        name="h1_list_programs",
+        description=(
+            "List programs currently stored in the local DB (after sync). "
+            "Optionally filter by substring of the program handle."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "handle_filter": {
+                    "type": "string",
+                    "description": "Case-insensitive substring of the program handle",
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="h1_get_scope",
+        description=(
+            "Return all in-scope assets for a single program from the local "
+            "DB (after sync). Each row gives asset_type, identifier, "
+            "max_severity, eligible_for_bounty, and the maintainer's free-text "
+            "instruction."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "program_handle": {
+                    "type": "string",
+                    "description": "HackerOne program handle, e.g. 'shopify'",
+                },
+            },
+            "required": ["program_handle"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="scope_summary",
+        description=(
+            "Return counts grouped by (program, asset_type). If "
+            "program_handle is given, returns per-asset-type totals plus a "
+            "scan-status breakdown for that program only. Use to render the "
+            "scope picker at session start."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "program_handle": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="scan_claim_next",
+        description=(
+            "Atomically claim the next pending target. Marks it 'in_progress' "
+            "and returns its row, or returns {target: null} if nothing is "
+            "available. Stale claims (in_progress > 4h) are automatically "
+            "reclaimable. Optional filters narrow the queue."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "program_handles": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Limit to these program handles",
+                },
+                "asset_types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Limit to these asset types (e.g. SOURCE_CODE, URL, WILDCARD, DOMAIN, IP_ADDRESS)",
+                },
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="scan_mark_done",
+        description="Mark a target as 'done' with a short summary of what was scanned.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target_id": {"type": "integer"},
+                "summary": {"type": "string"},
+            },
+            "required": ["target_id"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="scan_mark_skipped",
+        description=(
+            "Mark a target as 'skipped' with a reason (e.g. archived, demo, "
+            "out-of-scope-after-recon, oversized). Frees the slot."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target_id": {"type": "integer"},
+                "reason": {"type": "string"},
+            },
+            "required": ["target_id", "reason"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="scan_status",
+        description=(
+            "Return scan-status counts (pending / in_progress / done / "
+            "skipped / error). Optionally scoped to a single program."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {"program_handle": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="finding_create",
+        description=(
+            "Record a candidate finding against a target. Status is "
+            "'candidate' — promote to 'confirmed' via finding_confirm only "
+            "after an independent validator subagent agrees."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target_id": {"type": "integer"},
+                "title": {"type": "string"},
+                "severity": {
+                    "type": "string",
+                    "description": "low | medium | high | critical",
+                },
+                "vuln_type": {"type": "string"},
+                "asset": {"type": "string", "description": "Specific URL/path/file:line"},
+                "poc_path": {
+                    "type": "string",
+                    "description": "Path to the PoC file (markdown/curl/script)",
+                },
+                "notes": {"type": "string"},
+            },
+            "required": ["target_id", "title"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="finding_confirm",
+        description="Promote a candidate finding to 'confirmed' after validator pass.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "finding_id": {"type": "integer"},
+                "validator_notes": {"type": "string"},
+            },
+            "required": ["finding_id"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="finding_reject",
+        description="Mark a finding as 'rejected' (false positive / out of scope / dup-of-known).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "finding_id": {"type": "integer"},
+                "reason": {"type": "string"},
+            },
+            "required": ["finding_id", "reason"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="finding_list",
+        description=(
+            "List findings. Filter by status (candidate|confirmed|rejected|"
+            "submitted|duplicate) and/or program_handle. Use this to review "
+            "what's ready to submit on hackerone.com."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string"},
+                "program_handle": {"type": "string"},
+                "limit": {"type": "integer", "default": 200},
+            },
+            "additionalProperties": False,
+        },
+    ),
+]
+
+PENTEST_TOOLS = PENTEST_TOOLS + H1_TOOLS
+
+
+H1_TOOL_NAMES = {t.name for t in H1_TOOLS}
+
+
 def create_server() -> Server:
     """Create the MCP server with pentest tools."""
     server = Server("strix-claude-code")
+
+    # DB is lazy-initialized; calling init_db() here is cheap and idempotent.
+    try:
+        _h1_db.init_db()
+    except Exception as e:
+        logger.warning("DB init failed (H1 tools will error individually): %s", e)
 
     tool_client: ToolServerClient | None = None
 
@@ -601,6 +827,10 @@ def create_server() -> Server:
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         nonlocal tool_client
+
+        # H1 / scan-queue / findings tools (host-local, no sandbox needed)
+        if name in H1_TOOL_NAMES:
+            return await handle_h1_tool(name, arguments)
 
         # Handle local tools (write to host filesystem)
         if name == "write_report":
@@ -1155,7 +1385,7 @@ def create_server() -> Server:
             return [TextContent(type="text", text="Error: org parameter is required")]
 
         try:
-            from .github_org import fetch_org_repos
+            from strix_cli_claude.github_org import fetch_org_repos
             repos = fetch_org_repos(org, include_private=include_private, max_size_kb=max_size_kb)
 
             if not repos:
@@ -1174,6 +1404,153 @@ def create_server() -> Server:
             return [TextContent(type="text", text=f"Error: {e}")]
         except Exception as e:
             return [TextContent(type="text", text=f"Error fetching repos: {e}")]
+
+    async def handle_h1_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+        """Dispatch for H1 / scan-queue / findings tools. All run in-process."""
+
+        def _txt(payload: Any) -> list[TextContent]:
+            if isinstance(payload, str):
+                return [TextContent(type="text", text=payload)]
+            return [TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
+
+        try:
+            if name == "h1_sync_programs":
+                programs_synced = 0
+                targets_synced = 0
+                handles: list[str] = []
+                with H1Client() as client:
+                    programs = client.list_programs()
+                    with _h1_db.get_conn() as conn:
+                        for p in programs:
+                            _h1_db.upsert_program(
+                                conn,
+                                handle=p["handle"],
+                                name=p["name"],
+                                policy_url=p["policy_url"],
+                                offers_bounty=p["offers_bounty"],
+                                submission_state=p.get("submission_state"),
+                            )
+                            handles.append(p["handle"])
+                            programs_synced += 1
+
+                    for p in programs:
+                        try:
+                            scopes = client.get_structured_scopes(p["handle"])
+                        except H1Error as e:
+                            logger.warning("scope fetch failed for %s: %s", p["handle"], e)
+                            continue
+                        with _h1_db.get_conn() as conn:
+                            for s in scopes:
+                                if not s.get("eligible_for_submission"):
+                                    continue
+                                _h1_db.upsert_target(
+                                    conn,
+                                    program_handle=p["handle"],
+                                    asset_type=s["asset_type"],
+                                    identifier=s["asset_identifier"],
+                                    eligible_for_bounty=s["eligible_for_bounty"],
+                                    max_severity=s.get("max_severity"),
+                                    instruction=s.get("instruction"),
+                                )
+                                targets_synced += 1
+
+                _h1_db.mark_programs_archived_except(handles)
+                return _txt({
+                    "programs_synced": programs_synced,
+                    "targets_synced": targets_synced,
+                })
+
+            if name == "h1_list_programs":
+                return _txt(_h1_db.list_programs(arguments.get("handle_filter")))
+
+            if name == "h1_get_scope":
+                handle = arguments.get("program_handle")
+                if not handle:
+                    return _txt("Error: program_handle is required")
+                with _h1_db.get_conn() as conn:
+                    rows = conn.execute(
+                        "SELECT id, asset_type, identifier, eligible_for_bounty,"
+                        " max_severity, instruction, scan_status, summary"
+                        " FROM targets WHERE program_handle=? ORDER BY asset_type, id",
+                        (handle,),
+                    ).fetchall()
+                return _txt([dict(r) for r in rows])
+
+            if name == "scope_summary":
+                return _txt(_h1_db.scope_summary(arguments.get("program_handle")))
+
+            if name == "scan_claim_next":
+                row = _h1_db.claim_next_target(
+                    program_handles=arguments.get("program_handles"),
+                    asset_types=arguments.get("asset_types"),
+                )
+                return _txt({"target": row})
+
+            if name == "scan_mark_done":
+                target_id = arguments.get("target_id")
+                if target_id is None:
+                    return _txt("Error: target_id is required")
+                _h1_db.mark_target(int(target_id), "done", arguments.get("summary"))
+                return _txt({"ok": True, "target_id": int(target_id), "status": "done"})
+
+            if name == "scan_mark_skipped":
+                target_id = arguments.get("target_id")
+                reason = arguments.get("reason")
+                if target_id is None or not reason:
+                    return _txt("Error: target_id and reason are required")
+                _h1_db.mark_target(int(target_id), "skipped", reason)
+                return _txt({"ok": True, "target_id": int(target_id), "status": "skipped"})
+
+            if name == "scan_status":
+                return _txt(_h1_db.scan_status_counts(arguments.get("program_handle")))
+
+            if name == "finding_create":
+                target_id = arguments.get("target_id")
+                title = arguments.get("title")
+                if target_id is None or not title:
+                    return _txt("Error: target_id and title are required")
+                fid = _h1_db.create_finding(
+                    target_id=int(target_id),
+                    title=title,
+                    severity=arguments.get("severity"),
+                    vuln_type=arguments.get("vuln_type"),
+                    asset=arguments.get("asset"),
+                    poc_path=arguments.get("poc_path"),
+                    notes=arguments.get("notes"),
+                )
+                return _txt({"ok": True, "finding_id": fid, "status": "candidate"})
+
+            if name == "finding_confirm":
+                fid = arguments.get("finding_id")
+                if fid is None:
+                    return _txt("Error: finding_id is required")
+                _h1_db.update_finding_status(
+                    int(fid), "confirmed", arguments.get("validator_notes")
+                )
+                return _txt({"ok": True, "finding_id": int(fid), "status": "confirmed"})
+
+            if name == "finding_reject":
+                fid = arguments.get("finding_id")
+                reason = arguments.get("reason")
+                if fid is None or not reason:
+                    return _txt("Error: finding_id and reason are required")
+                _h1_db.update_finding_status(int(fid), "rejected", reason)
+                return _txt({"ok": True, "finding_id": int(fid), "status": "rejected"})
+
+            if name == "finding_list":
+                return _txt(_h1_db.list_findings(
+                    status=arguments.get("status"),
+                    program_handle=arguments.get("program_handle"),
+                    limit=int(arguments.get("limit") or 200),
+                ))
+
+            return _txt(f"Error: unknown H1 tool '{name}'")
+
+        except H1Error as e:
+            return _txt(f"Error (HackerOne API): {e}")
+        except Exception as e:
+            logger.exception("H1 tool '%s' failed", name)
+            return _txt(f"Error: {type(e).__name__}: {e}")
 
     return server
 

@@ -986,6 +986,275 @@ START PHASE 1 NOW. Fetch the repos first.
             console.print("[green]Sandbox stopped.[/green]")
 
 
+def _handle_h1_scan(
+    h1_programs: list[str],
+    h1_asset_types: list[str],
+    scan_mode: str,
+    instruction: str | None,
+    output_file: str | None,
+    image: str | None,
+    mount_docker: bool,
+    keep_container: bool,
+    verbose: bool,
+) -> None:
+    """Run Strix in HackerOne work-queue mode.
+
+    No target is supplied on the CLI — Claude pulls programs/scopes from the
+    HackerOne API into ~/.strix/strix.db, then loops:
+        scan_claim_next → set up → scan → finding_create → validator
+        → finding_confirm/reject → scan_mark_done → repeat.
+    """
+    from datetime import datetime
+    import secrets
+
+    if not output_file:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = str(Path.cwd() / f"strix_h1_{timestamp}.md")
+    else:
+        output_file = str(Path(output_file).resolve())
+
+    scan_id = secrets.token_hex(4)
+
+    filter_summary_lines: list[str] = []
+    if h1_programs:
+        filter_summary_lines.append(f"Programs: {', '.join(h1_programs)}")
+    else:
+        filter_summary_lines.append("Programs: (any — will ask)")
+    if h1_asset_types:
+        filter_summary_lines.append(f"Asset types: {', '.join(h1_asset_types)}")
+    else:
+        filter_summary_lines.append("Asset types: (any — will ask)")
+
+    console.print(Panel(
+        "[bold]HackerOne work-queue mode[/bold]\n"
+        + "\n".join(filter_summary_lines)
+        + f"\n[dim]DB: ~/.strix/strix.db   Output: {output_file}[/dim]",
+        title="Strix Claude Code — H1 Mode",
+    ))
+
+    sandbox: Sandbox | None = None
+    temp_config_dir: str | None = None
+
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Starting Docker sandbox...", total=None)
+            sandbox = Sandbox(image=image, scan_id=scan_id, mount_docker_socket=mount_docker)
+            if not keep_container:
+                atexit.register(sandbox.stop)
+            sandbox_info = sandbox.start()
+            progress.update(task, description="Sandbox started!")
+
+        console.print(f"[green]Sandbox ready![/green]")
+        console.print(f"  Container: {sandbox_info['container_name']}")
+        console.print(f"  Tool server: {sandbox_info['tool_server_url']}")
+        console.print(f"  CPUs allocated: {sandbox_info['cpu_count']}")
+
+        mcp_config = create_mcp_config(
+            sandbox_info["tool_server_url"],
+            sandbox_info["tool_server_token"],
+            sandbox_info["scan_id"],
+            output_file,
+        )
+
+        temp_config_dir = tempfile.mkdtemp(prefix=f"strix-h1-{scan_id}")
+        mcp_config_path = Path(temp_config_dir) / "mcp.json"
+        mcp_config_path.write_text(json.dumps(mcp_config, indent=2))
+
+        target_info = "HackerOne queue (programs/assets resolved at runtime via MCP)"
+        system_prompt = get_system_prompt(
+            target_info, scan_mode, sandbox_info["cpu_count"], instruction, output_file, mount_docker
+        )
+
+        # Bake filter values into the initial prompt so Claude calls
+        # scan_claim_next with the right args. Empty list → no filter.
+        filter_prog_json = json.dumps(h1_programs)
+        filter_at_json = json.dumps(h1_asset_types)
+
+        initial_prompt = f"""H1 BOUNTY MODE — WORK QUEUE PROTOCOL
+
+You are operating against the user's HackerOne queue. The local SQLite
+(via MCP tools) is the authoritative work list. No -t target was supplied —
+your job is to pick from the queue, scan, record, and loop.
+
+FILTERS FOR THIS SESSION (passed verbatim to scan_claim_next):
+  program_handles = {filter_prog_json}
+  asset_types     = {filter_at_json}
+  (empty list = no filter on that dimension)
+
+==============================================================================
+PHASE 0 — SYNC AND SELECT
+==============================================================================
+
+1. Call scope_summary() with no args.
+   - If it returns [] → the local DB is empty. Call h1_sync_programs() to pull
+     programs and scopes from the HackerOne API. Then call scope_summary() again.
+   - h1_sync_programs may take 1–5 minutes the first time. Do not retry on
+     timeout; just wait.
+
+2. If the filters above contain non-empty values for BOTH program_handles AND
+   asset_types: skip the interactive picker and proceed straight to LOOP.
+
+3. Otherwise: render an interactive picker.
+   - Print scope_summary() as a table grouped by program. Show top 30 programs
+     by total target count, with their asset types and per-status counts.
+     For each program also show a "★" line if offers_bounty == 1.
+   - Ask the user (EXACTLY this line, then WAIT):
+
+       Pick a program handle (or "any"). Then which asset_types? (comma-separated, or "all")
+       e.g.  shopify SOURCE_CODE,URL    |    any SOURCE_CODE    |    gitlab all
+
+   - Parse the reply. Set:
+       filter_program     = [<handle>] if user picked one, else []
+       filter_asset_types = list from reply, mapped to UPPER_CASE, [] if "all"
+     Confirm back to the user in one short line: "Filtering to: program=… asset_types=…"
+
+==============================================================================
+LOOP — runs until queue empty
+==============================================================================
+
+While True:
+    res = scan_claim_next(program_handles=filter_program, asset_types=filter_asset_types)
+    if res.target is None:
+        print "Queue empty for these filters." and break.
+
+    target = res.target   # {{id, program_handle, asset_type, identifier, max_severity, instruction, ...}}
+
+    PRINT one status line: "→ <program_handle> [<asset_type>] <identifier> (#<id>)"
+
+    SET UP the target by asset_type:
+      SOURCE_CODE
+          slug = a safe filename from identifier
+          terminal_execute: git clone --depth 1 "<identifier>" "/workspace/<slug>"
+          Run the whitebox phases (PHASE 1 component discovery → testing
+          → re-validation) from your system prompt against /workspace/<slug>.
+
+      URL
+          recon (httpx/nuclei) then blackbox phases against identifier.
+
+      DOMAIN
+          subfinder + dnsx + httpx, then per-host blackbox.
+
+      WILDCARD
+          Enumerate sub-assets from the wildcard (subfinder etc.). Treat each
+          sub-asset as work under THIS target_id. Do NOT call scan_claim_next
+          for sub-assets — record findings against the parent target.id.
+
+      IP_ADDRESS / IP_RANGE
+          nmap -p- -sV then service-specific testing.
+
+      anything else (HARDWARE, EXECUTABLE, OTHER, …)
+          scan_mark_skipped(target.id, reason="unsupported asset_type=<type>")
+          continue
+
+    HONOR scope instructions: target.instruction often says things like
+    "no DoS", "no automated scanners on prod", "production hostnames excluded".
+    Read it. If a planned action violates it, drop that action.
+
+    SCAN. Use the system-prompt phases. Do not invent new ones.
+
+    FOR EACH candidate vulnerability:
+        finding_create(
+            target_id  = target.id,
+            title      = "...",
+            severity   = "low|medium|high|critical",
+            vuln_type  = "...",
+            asset      = "<specific URL / file:line>",
+            poc_path   = "<path to PoC file in /workspace or host>",
+            notes      = "<short reproducer summary>"
+        )
+        # Status defaults to 'candidate'
+
+    INDEPENDENT VALIDATOR — for each candidate:
+        Spawn a fresh subagent with no prior context. Pass it ONLY the
+        finding's PoC and asset. Ask it to decide VALID vs FALSE_POSITIVE
+        using strict external-attacker H1 triage standards.
+        On VALID  → finding_confirm(finding_id=<id>, validator_notes="…")
+        On FALSE_POSITIVE → finding_reject(finding_id=<id>, reason="…")
+
+    scan_mark_done(
+        target_id = target.id,
+        summary   = "<one short line: what was tested, what was/was-not found>"
+    )
+
+==============================================================================
+WHEN THE LOOP EXITS
+==============================================================================
+
+- scan_status()           → report counts to the user.
+- finding_list(status="confirmed") → list everything ready for manual submission.
+- finding_list(status="candidate") → flag anything left un-validated.
+- STOP. Do NOT loop again unless the user asks. Do NOT call any
+  HackerOne write endpoint — submission is manual on hackerone.com.
+
+==============================================================================
+HARD RULES
+==============================================================================
+
+- NEVER call HackerOne API write endpoints. There are none exposed in MCP —
+  if you find yourself wanting one, stop.
+- NEVER spend > 30 minutes on a single target without calling finding_create,
+  scan_mark_done, or scan_mark_skipped. If stuck, mark skipped with reason.
+- NEVER mix in unrelated targets. Stay in the queue.
+- NEVER scan an asset whose target.eligible_for_bounty == 0 unless the user
+  explicitly told you to. Use scan_mark_skipped(reason="not eligible for bounty").
+
+START PHASE 0 NOW. Call scope_summary() first.
+"""
+
+        console.print("\n[bold]Starting Claude CLI for H1 work queue...[/bold]\n")
+        console.print("=" * 60)
+
+        claude_env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
+        claude_base_args = [
+            "claude",
+            "--model", "claude-opus-4-7",
+            "--mcp-config", str(mcp_config_path),
+            "--append-system-prompt", system_prompt,
+            "--permission-mode", "bypassPermissions",
+            "--dangerously-skip-permissions",
+        ]
+
+        if sys.stdin.isatty():
+            subprocess.run(
+                claude_base_args + [initial_prompt],
+                cwd=temp_config_dir,
+                env=claude_env,
+            )
+        else:
+            console.print(f"\n[bold yellow]No interactive terminal - running in print mode.[/bold yellow]")
+            subprocess.run(
+                claude_base_args + ["--print", initial_prompt],
+                cwd=temp_config_dir,
+                env=claude_env,
+            )
+
+        console.print("\n" + "=" * 60)
+        console.print("[bold]H1 session ended.[/bold]")
+
+    except SandboxError as e:
+        console.print(f"[red]Sandbox error:[/red] {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        if verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+    finally:
+        if temp_config_dir and Path(temp_config_dir).exists():
+            shutil.rmtree(temp_config_dir, ignore_errors=True)
+        if sandbox and not keep_container:
+            with console.status("Stopping sandbox..."):
+                sandbox.stop()
+            console.print("[green]Sandbox stopped.[/green]")
+
+
 def classify_target(target: str) -> dict[str, str]:
     """Classify a target as GitHub repo/org, local path, URL, domain, or IP."""
     from pathlib import Path
@@ -1041,6 +1310,9 @@ def classify_target(target: str) -> dict[str, str]:
 @click.option("--mount-docker", is_flag=True, help="Mount Docker socket for container scanning (trivy, docker inspect, etc.)")
 @click.option("--keep-container", is_flag=True, help="Keep container running after scan")
 @click.option("--scan-id", help="Scan ID (used by TUI for tracking)")
+@click.option("--h1", "h1_mode", is_flag=True, help="HackerOne work-queue mode: pull programs/scopes from H1 API, scan from the local queue, record findings to ~/.strix/strix.db. Requires H1_USERNAME and H1_TOKEN in env.")
+@click.option("--program", "h1_programs", multiple=True, help="(H1 mode) Limit claims to this program handle. Can be repeated.")
+@click.option("--asset-types", "h1_asset_types", help="(H1 mode) Comma-separated asset types to claim (e.g. SOURCE_CODE,URL).")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def main(
     targets: tuple[str, ...],
@@ -1052,6 +1324,9 @@ def main(
     mount_docker: bool,
     keep_container: bool,
     scan_id: str | None,
+    h1_mode: bool,
+    h1_programs: tuple[str, ...],
+    h1_asset_types: str | None,
     verbose: bool,
 ):
     """Strix Claude Code - AI-powered penetration testing using Claude CLI.
@@ -1086,6 +1361,35 @@ def main(
     # Load instruction from file if provided
     if instruction_file:
         instruction = Path(instruction_file).read_text()
+
+    # HackerOne work-queue mode: targets come from the local DB, not -t.
+    if h1_mode:
+        if not os.environ.get("H1_USERNAME") or not os.environ.get("H1_TOKEN"):
+            console.print(Panel(
+                "[red]H1_USERNAME and H1_TOKEN must be set in env for --h1 mode.[/red]\n\n"
+                "Add to your shell rc:\n"
+                "  export H1_USERNAME=<your-h1-api-username>\n"
+                "  export H1_TOKEN=<your-h1-api-token>",
+                title="Missing HackerOne credentials",
+            ))
+            sys.exit(1)
+        asset_types_list = (
+            [a.strip().upper() for a in h1_asset_types.split(",") if a.strip()]
+            if h1_asset_types
+            else []
+        )
+        _handle_h1_scan(
+            h1_programs=list(h1_programs),
+            h1_asset_types=asset_types_list,
+            scan_mode=scan_mode,
+            instruction=instruction,
+            output_file=output_file,
+            image=image,
+            mount_docker=mount_docker,
+            keep_container=keep_container,
+            verbose=verbose,
+        )
+        return
 
     # Classify all targets
     classified_targets = [classify_target(t) for t in targets]
