@@ -726,3 +726,12 @@ def set_verify_result(
             "verified_at=?, updated_at=? WHERE id=?",
             (status, verdict, recording, evidence, now, now, finding_id),
         )
+
+
+def clear_recording(finding_id: int) -> None:
+    """Forget a finding's recording (after the file is deleted)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE findings SET verify_recording=NULL, updated_at=? WHERE id=?",
+            (int(time.time()), finding_id),
+        )

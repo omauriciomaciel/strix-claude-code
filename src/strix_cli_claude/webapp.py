@@ -536,8 +536,11 @@ max-height:64vh;overflow-y:auto;line-height:1.45;
 
 <div class=overlay id=recov onclick="if(event.target===this)close_('recov')">
  <div class="sheet dark"><div class=sheethead><h3>PoC recording</h3><button class=x onclick="close_('recov')">&times;</button></div><div id=recbox>loading…</div>
-  <a id=recdl class=send style="display:block;text-align:center;text-decoration:none;margin-top:9px" target=_blank>Open raw</a>
-  <button class=send style="margin-top:8px;background:var(--surface2)" onclick="close_('recov')">Close</button>
+  <div style="display:flex;gap:8px;margin-top:11px">
+   <a id=recdl class=send style="flex:1;text-align:center;text-decoration:none" download>&#8681; Download</a>
+   <button class=send style="flex:1;background:#3a2226;color:#ff7b72" onclick="deleteRec()">&#128465; Delete</button>
+   <button class=send style="flex:1;background:var(--surface2)" onclick="close_('recov')">Close</button>
+  </div>
  </div>
 </div>
 
@@ -636,8 +639,15 @@ function show(t){activeTab=t;document.querySelectorAll('[data-view]').forEach(e=
 // actions
 async function setF(id,st){try{await post('/api/finding',{id,status:st});toast(st==='confirmed'?'Confirmed ✓':'Rejected','ok');refresh();}catch(e){toast('failed','err');}}
 async function verifyF(id){try{await post('/api/verify',{id});toast('verification queued — isolated repro running','ok');refresh();}catch(e){toast('verify failed','err');}}
+let recId=0;
+async function deleteRec(){
+ if(!recId||!confirm('Delete this recording? The verdict stays; only the file is removed.'))return;
+ try{await post('/api/recording/delete',{id:recId});toast('recording deleted','ok');close_('recov');refresh();}
+ catch(e){toast('delete failed','err');}
+}
 async function openRec(id){
- const box=$('recbox'); $('recdl').href='/recordings/'+id;
+ recId=id;
+ const box=$('recbox'); $('recdl').href='/recordings/'+id+'?download=1';
  box.textContent='loading…'; $('recov').classList.add('show'); lockBody();
  try{
   const r=await api('/recordings/'+id);
@@ -864,14 +874,34 @@ async def api_verify(request: Request):
 
 
 @app.get("/recordings/{finding_id}")
-def api_recording(finding_id: int):
+def api_recording(finding_id: int, download: bool = False):
     f = db.get_finding(finding_id)
     rec = f.get("verify_recording") if f else None
     if not rec or not Path(rec).exists():
         return PlainTextResponse("no recording", status_code=404)
+    if download:
+        return FileResponse(rec, filename=Path(rec).name, content_disposition_type="attachment")
     # Serve INLINE (no attachment) so it renders in the sheet — video plays,
     # text/cast transcripts display.
     return FileResponse(rec, content_disposition_type="inline")
+
+
+@app.post("/api/recording/delete")
+async def api_recording_delete(request: Request):
+    form = await _form(request)
+    try:
+        fid = int(form.get("id", ""))
+    except ValueError:
+        return PlainTextResponse("bad id", status_code=400)
+    f = db.get_finding(fid)
+    rec = f.get("verify_recording") if f else None
+    if rec:
+        try:
+            Path(rec).unlink(missing_ok=True)
+        except Exception:
+            pass
+    db.clear_recording(fid)
+    return PlainTextResponse("ok")
 
 
 @app.post("/api/launch")
