@@ -661,9 +661,9 @@ async function verPoll(){
  if(!$('verov').classList.contains('show')){clearInterval(verTimer);return;}
  try{
   const d=await getJSON('/api/verify-log/'+verId);
-  const alive=d.container?('🟢 '+d.container):'⚪ no container running';
-  let s='status: <b>'+esc(d.status)+'</b>'+(d.verdict?(' · '+esc(d.verdict)):'')+' · updated '+esc(d.updated_age)+' ago<br>'+alive;
-  if(d.evidence) s+='<br><br><b>evidence:</b> '+esc(d.evidence);
+  const alive=d.container?('🟢 sandbox: '+esc(d.container)):'⚪ no sandbox running';
+  let s='<div style="font-size:14px;color:var(--term-ink);margin-bottom:6px">'+esc(d.detail||d.status)+'</div>';
+  s+='<div style="font-size:11px">status <b>'+esc(d.status)+'</b>'+(d.verdict?(' · '+esc(d.verdict)):'')+' · updated '+esc(d.updated_age)+' ago · '+alive+'</div>';
   $('verstat').innerHTML=s;
   const box=$('verbox'); const bottom=box.scrollTop+box.clientHeight>=box.scrollHeight-40;
   box.textContent=d.log||'(no log yet — starting…)';
@@ -732,6 +732,11 @@ if STATIC_DIR.is_dir():
 def _startup() -> None:
     try:
         db.init_db()
+    except Exception:
+        pass
+    # Heal verifies orphaned by a restart (leaked containers + stuck 'running').
+    try:
+        verifier.reconcile_stale_startup()
     except Exception:
         pass
 
@@ -924,11 +929,13 @@ def api_verify_log(finding_id: int):
     f = db.get_finding(finding_id)
     if not f:
         return JSONResponse({"error": "no finding"}, status_code=404)
-    log = ""
+    status = f.get("verify_status") or "unverified"
+    log, log_age = "", None
     p = verifier.verify_log_path(finding_id)
     if p.exists():
         try:
             log = p.read_text(errors="replace")[-16000:]
+            log_age = _age_epoch(p.stat().st_mtime)
         except Exception:
             pass
     container = ""
@@ -942,14 +949,38 @@ def api_verify_log(finding_id: int):
                 break
     except Exception:
         pass
+
+    # Self-heal: if the DB says it's running but no sandbox is alive, the run
+    # died (crash / restart). Mark it so the UI tells the truth.
+    if status in ("queued", "running") and not container:
+        db.set_verify_status(
+            finding_id, "error",
+            log_append="interrupted — no sandbox running (the run died or the dashboard restarted). Re-verify to retry.")
+        status = "error"
+        log = (log + "\n[!] no sandbox running — marked interrupted").strip()
+
+    verdict = f.get("verify_verdict") or ""
+    evidence = (f.get("verify_evidence") or "")[:2000]
+    last_line = next((l.strip() for l in reversed(log.splitlines()) if l.strip()), "")
+    if status == "passed":
+        detail = "✅ Verified VALID — reproduced on pristine source." + (f" {evidence}" if evidence else "")
+    elif status == "failed":
+        detail = "❌ Could not reproduce — likely false positive." + (f" {evidence}" if evidence else "")
+    elif status == "inconclusive":
+        detail = "➖ Inconclusive (e.g. out of scope / needs input)." + (f" {evidence}" if evidence else "")
+    elif status == "running":
+        detail = f"⏳ Reproducing in an isolated sandbox. Sandbox {('alive — ' + container) if container else 'starting'}. Last log activity {log_age or '?'} ago."
+    elif status == "queued":
+        detail = "⏳ Queued — sandbox is starting…"
+    elif status == "error":
+        detail = "⚠️ " + (last_line or evidence or "Interrupted/failed — re-verify to retry.")
+    else:
+        detail = "Not verified yet. Tap Verify to reproduce it in an isolated sandbox."
+
     return JSONResponse({
-        "status": f.get("verify_status") or "unverified",
-        "verdict": f.get("verify_verdict") or "",
-        "evidence": (f.get("verify_evidence") or "")[:2000],
-        "updated_age": _age_epoch(f.get("updated_at")),
-        "container": container,
-        "recording": bool(f.get("verify_recording")),
-        "log": log,
+        "status": status, "verdict": verdict, "evidence": evidence, "detail": detail,
+        "updated_age": _age_epoch(f.get("updated_at")), "log_age": log_age,
+        "container": container, "recording": bool(f.get("verify_recording")), "log": log,
     })
 
 

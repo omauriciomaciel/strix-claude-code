@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -282,6 +283,55 @@ def launch_verification(finding_id: int) -> None:
     db.set_verify_status(finding_id, "queued", log_append="queued for verification")
     t = threading.Thread(target=_run_verification, args=(finding_id,), daemon=True)
     t.start()
+
+
+def live_verify_finding_ids() -> set[int]:
+    """finding ids that currently have a RUNNING verify sandbox container."""
+    ids: set[int] = set()
+    try:
+        out = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
+                             capture_output=True, text=True, timeout=10).stdout
+        for n in out.splitlines():
+            m = re.match(r"strix-cli-verify-(\d+)-", n.strip())
+            if m:
+                ids.add(int(m.group(1)))
+    except Exception:
+        pass
+    return ids
+
+
+def reconcile_stale_startup() -> int:
+    """Heal verifies orphaned by a dashboard restart.
+
+    The verifier runs in a thread inside the web process, so a restart kills it
+    mid-run: the sandbox container leaks and the DB stays 'running' forever.
+    On startup NO verify is legitimately in-flight, so: remove every leftover
+    verify container, and mark every queued/running finding as interrupted so the
+    UI stops lying about it.
+    """
+    try:
+        out = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}"],
+                             capture_output=True, text=True, timeout=15).stdout
+        for name in out.splitlines():
+            name = name.strip()
+            if name.startswith("strix-cli-verify-"):
+                subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30)
+    except Exception:
+        pass
+    n = 0
+    try:
+        for f in db.list_findings(limit=2000):
+            if (f.get("verify_status") or "") in ("queued", "running"):
+                _progress(
+                    f["id"],
+                    "interrupted — the dashboard was restarted while verifying; "
+                    "the sandbox was removed. Re-verify to retry.",
+                    status="error",
+                )
+                n += 1
+    except Exception:
+        pass
+    return n
 
 
 def stop_verification(finding_id: int) -> bool:
