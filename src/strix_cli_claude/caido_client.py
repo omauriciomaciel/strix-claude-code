@@ -59,7 +59,7 @@ mutation CreateProject($input: CreateProjectInput!) {
 
 _SELECT_PROJECT = """
 mutation SelectProject($id: ID!) {
-  selectProject(id: $id) { project { id name } }
+  selectProject(id: $id) { currentProject { project { id name } } error { __typename } }
 }
 """
 
@@ -263,6 +263,10 @@ class CaidoClient:
             self._client = None
 
 
+def _httpql_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def _build_httpql_filter(
     *,
     host: str | None = None,
@@ -272,25 +276,20 @@ def _build_httpql_filter(
 ) -> dict[str, Any] | None:
     """Compose a Caido HTTPQL filter.
 
-    Caido's HTTPQL is an OR-of-ANDs expression; the simplest filter is a list
-    of single-condition clauses that we AND together via the ``and`` operator
-    exposed by ``HTTPQLInput``. We only support the four fields this wrapper
-    exposes to the agent; users wanting more can hit the GraphQL endpoint
-    directly. Each clause is ``{ "<field>": {"op": "<eq|contains>", "value":
-    ... } }``. Caido accepts lowercase field names (``host``, ``method``,
-    ``path``, ``resp.status``).
+    ``HTTPQLInput`` is just ``{code: String!}`` - a single raw HTTPQL query
+    string, not a structured tree of clauses. Field names are prefixed
+    (``req.host``, ``req.method``, ``req.path``, ``resp.code`` - not
+    ``resp.status``) and clauses are joined with ``and``.
     """
-    clauses: list[dict[str, Any]] = []
+    clauses: list[str] = []
     if host:
-        clauses.append({"host": {"eq": host}})
+        clauses.append(f"req.host.cont:{_httpql_quote(host)}")
     if method:
-        clauses.append({"method": {"eq": method.upper()}})
+        clauses.append(f"req.method.eq:{_httpql_quote(method.upper())}")
     if path:
-        clauses.append({"path": {"contains": path}})
+        clauses.append(f"req.path.cont:{_httpql_quote(path)}")
     if status_code is not None:
-        clauses.append({"resp.status": {"eq": status_code}})
+        clauses.append(f"resp.code.eq:{status_code}")
     if not clauses:
         return None
-    if len(clauses) == 1:
-        return clauses[0]
-    return {"and": clauses}
+    return {"code": " and ".join(clauses)}

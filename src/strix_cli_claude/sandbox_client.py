@@ -46,8 +46,7 @@ _AGENT_BROWSER_SHOT_DIR = "/workspace/.agent-browser-screenshots"
 # included" feel the old tool_server advertised.
 _PYTHON_PREAMBLE = (
     "import json, base64, hashlib, re, asyncio\n"
-    "import requests, httpx, aiohttp\n"
-    "from bs4 import BeautifulSoup\n"
+    "import requests, aiohttp\n"
 )
 
 _EDITOR_HELPER_PATH = "/tmp/_strix_editor_helper.py"
@@ -366,6 +365,15 @@ class SandboxExecClient:
         headers = params.get("headers") or {}
         body = params.get("body")
 
+        # Caido's proxy refuses to handle traffic until a project is
+        # selected. list_requests/view_request trigger that via
+        # _get_caido(), but send_request may be the first proxy call in the
+        # session, so bootstrap it here too.
+        try:
+            await self._get_caido()
+        except CaidoError as e:
+            return {"error": f"send_request could not bootstrap Caido: {e}"}
+
         curl_cmd = ["curl", "-sS", "-i", "-X", method]
         for k, v in headers.items():
             curl_cmd.extend(["-H", f"{k}: {v}"])
@@ -382,7 +390,10 @@ class SandboxExecClient:
             curl_cmd.extend(["--data-binary", f"@{body_path}"])
         curl_cmd.append(url)
 
-        result = self._exec(curl_cmd, timeout=60)
+        # /etc/profile.d/proxy.sh (which exports the Caido proxy env vars) is
+        # only sourced by login shells - exec_run'ing curl's argv directly
+        # bypasses it entirely, so the request never reaches Caido.
+        result = self._exec(["bash", "-lc", shlex.join(curl_cmd)], timeout=60)
         # Clean up the temp body file if we wrote one.
         if body_path is not None:
             try:
@@ -506,8 +517,9 @@ def _agent_browser_argv(action: str, params: dict[str, Any]) -> list[str]:
     wrap it in an ``{"error": ...}`` dict.
     """
     if action == "launch":
-        # `agent-browser open [url]` (no url = launch on about:blank).
-        return ["open"] + ([params["url"]] if params.get("url") else [])
+        # `agent-browser open <url>` always requires a url arg; default to
+        # about:blank when the caller doesn't give one.
+        return ["open", params.get("url") or "about:blank"]
     if action == "goto":
         url = params.get("url")
         if not url:
