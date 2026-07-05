@@ -393,7 +393,7 @@ def _run_verification(finding_id: int) -> None:
         prompt = build_verifier_prompt(finding)
         _progress(finding_id, "reproducing on pristine source — building env + running PoC (can take many minutes)")
 
-        env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
+        env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1", "IS_SANDBOX": "1"}
         timeout_s = int(os.getenv("STRIX_VERIFY_TIMEOUT", "5400"))  # 90 min default
         # Stream the verifier's live output to the log file so the UI can show
         # real progress (and tell the run apart from a stuck one).

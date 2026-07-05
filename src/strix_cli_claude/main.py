@@ -735,6 +735,26 @@ def check_claude_cli() -> bool:
     return shutil.which("claude") is not None
 
 
+def _write_claude_trust_config(config_dir: str, project_cwd: str) -> str:
+    """Pre-accept the trust + bypass-permissions dialogs so a tty session never blocks.
+
+    CLAUDE_CODE_SKIP_TRUST_DIALOG isn't a real claude CLI env var (confirmed by
+    inspecting the shipped binary - it's silently ignored). The dialogs are only
+    skippable via on-disk config: per-project `hasTrustDialogAccepted` in
+    `.claude.json`, and `skipDangerousModePermissionPrompt` in `settings.json`.
+    Pointing CLAUDE_CONFIG_DIR at our own temp dir keeps this isolated from the
+    user's real ~/.claude config.
+    """
+    Path(config_dir, ".claude.json").write_text(json.dumps({
+        "bypassPermissionsModeAccepted": True,
+        "projects": {project_cwd: {"hasTrustDialogAccepted": True}},
+    }))
+    Path(config_dir, "settings.json").write_text(json.dumps({
+        "skipDangerousModePermissionPrompt": True,
+    }))
+    return config_dir
+
+
 def clone_github_repo(repo_url: str, target_dir: Path) -> Path:
     """Clone a GitHub repository via SSH or HTTPS.
 
@@ -959,7 +979,8 @@ START PHASE 1 NOW. Fetch the repos first.
         console.print("\n[bold]Starting Claude CLI for org scan...[/bold]\n")
         console.print("=" * 60)
 
-        claude_env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
+        _write_claude_trust_config(temp_config_dir, temp_config_dir)
+        claude_env = {**os.environ, "IS_SANDBOX": "1", "CLAUDE_CONFIG_DIR": temp_config_dir}
         claude_base_args = [
             "claude",
             "--mcp-config", str(mcp_config_path),
@@ -1293,7 +1314,8 @@ Then WAIT for the user. Do not call any tool until they tell you what to do.
         console.print("\n[bold]Starting Claude CLI for bounty queue...[/bold]\n")
         console.print("=" * 60)
 
-        claude_env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
+        _write_claude_trust_config(temp_config_dir, temp_config_dir)
+        claude_env = {**os.environ, "IS_SANDBOX": "1", "CLAUDE_CONFIG_DIR": temp_config_dir}
         claude_base_args = [
             "claude",
             "--mcp-config", str(mcp_config_path),
@@ -1675,6 +1697,7 @@ curl -s -X POST "{sandbox_info["tool_server_url"]}/execute" \\
 
         wrapper_script.write_text(f'''#!/bin/bash
 export CLAUDE_CODE_SKIP_TRUST_DIALOG=1
+export IS_SANDBOX=1
 exec claude \\
     --mcp-config "{mcp_config_path}" \\
     --append-system-prompt "$(cat "{system_prompt_path}")" \\
@@ -2369,7 +2392,8 @@ For each URL above, call the `download_extension` MCP tool with that URL — it 
             initial_prompt = extension_preamble + initial_prompt
 
         # Common claude args
-        claude_env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
+        _write_claude_trust_config(temp_config_dir, temp_config_dir)
+        claude_env = {**os.environ, "IS_SANDBOX": "1", "CLAUDE_CONFIG_DIR": temp_config_dir}
         claude_base_args = [
             "claude",
             "--mcp-config", str(mcp_config_path),
