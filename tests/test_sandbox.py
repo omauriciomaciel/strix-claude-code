@@ -139,35 +139,6 @@ class TestFindAvailablePort:
             assert port2 != port1
 
 
-class TestGenerateToken:
-    """Tests for _generate_token method."""
-
-    def test_returns_string(self):
-        """Should return a string token."""
-        with patch("docker.from_env") as mock_docker:
-            mock_docker.return_value = MagicMock()
-            sb = Sandbox()
-            token = sb._generate_token()
-            assert isinstance(token, str)
-
-    def test_returns_non_empty_token(self):
-        """Should return a non-empty token."""
-        with patch("docker.from_env") as mock_docker:
-            mock_docker.return_value = MagicMock()
-            sb = Sandbox()
-            token = sb._generate_token()
-            assert len(token) > 0
-
-    def test_returns_different_tokens(self):
-        """Should return different tokens on subsequent calls."""
-        with patch("docker.from_env") as mock_docker:
-            mock_docker.return_value = MagicMock()
-            sb = Sandbox()
-            token1 = sb._generate_token()
-            token2 = sb._generate_token()
-            assert token1 != token2
-
-
 class TestExecWithTimeout:
     """Tests for _exec_with_timeout method."""
 
@@ -298,15 +269,16 @@ class TestSandboxStart:
             mock_client.containers.get.side_effect = NotFound("Not found")
 
             with patch.object(Sandbox, "ensure_image"):
-                with patch.object(Sandbox, "_initialize_container"):
+                with patch.object(Sandbox, "_wait_for_ready"):
                     with patch.object(Sandbox, "_find_available_port", side_effect=[8080, 9090]):
                         sb = Sandbox(scan_id="test123")
                         result = sb.start()
 
                         assert "container_id" in result
                         assert "container_name" in result
-                        assert "tool_server_url" in result
-                        assert "tool_server_token" in result
+                        assert "caido_port" in result
+                        assert "tool_server_url" not in result
+                        assert "tool_server_token" not in result
                         assert "scan_id" in result
                         assert result["scan_id"] == "test123"
 
@@ -324,7 +296,7 @@ class TestSandboxStart:
             mock_client.containers.run.return_value = mock_new
 
             with patch.object(Sandbox, "ensure_image"):
-                with patch.object(Sandbox, "_initialize_container"):
+                with patch.object(Sandbox, "_wait_for_ready"):
                     with patch.object(Sandbox, "_find_available_port", return_value=8080):
                         sb = Sandbox(scan_id="test")
                         sb.start()
@@ -343,7 +315,7 @@ class TestSandboxStart:
             mock_client.containers.get.side_effect = NotFound("Not found")
 
             with patch.object(Sandbox, "ensure_image"):
-                with patch.object(Sandbox, "_initialize_container"):
+                with patch.object(Sandbox, "_wait_for_ready"):
                     with patch.object(Sandbox, "_find_available_port", return_value=8080):
                         with patch.object(Sandbox, "_copy_local_sources") as mock_copy:
                             sb = Sandbox()
@@ -362,7 +334,7 @@ class TestSandboxStart:
             mock_client.containers.get.side_effect = NotFound("Not found")
 
             with patch.object(Sandbox, "ensure_image"):
-                with patch.object(Sandbox, "_initialize_container"):
+                with patch.object(Sandbox, "_wait_for_ready"):
                     with patch.object(Sandbox, "_find_available_port", return_value=8080):
                         with patch("strix_cli_claude.sandbox.get_cpu_count", return_value=4):
                             sb = Sandbox()
@@ -373,56 +345,75 @@ class TestSandboxStart:
                             assert env["STRIX_CPU_COUNT"] == "4"
 
 
-class TestInitializeContainer:
-    """Tests for _initialize_container method."""
+class TestWaitForReady:
+    """Tests for _wait_for_ready method (replaces the old _initialize_container
+    + _wait_for_health pair since strix-sandbox 1.0.0 sets up Caido itself)."""
 
-    def test_raises_error_when_no_container(self):
-        """Should raise SandboxError when container not started."""
+    def test_returns_when_caido_and_proxy_ready(self):
+        """Should return once Caido responds and proxy.sh exists."""
+        with patch("docker.from_env") as mock_docker:
+            mock_docker.return_value = MagicMock()
+            mock_container = MagicMock()
+            sb = Sandbox()
+            sb._container = mock_container
+
+            # First call: httpx probe succeeds (200) -> Caido is up.
+            # Second phase: exec `test -f /etc/profile.d/proxy.sh` succeeds.
+            with patch("httpx.Client") as mock_client_class:
+                mock_client = MagicMock()
+                mock_client_class.return_value.__enter__.return_value = mock_client
+                mock_response = MagicMock()
+                mock_response.status_code = 200
+                mock_client.get.return_value = mock_response
+
+                ready_probe = MagicMock()
+                ready_probe.exit_code = 0
+                mock_container.exec_run.return_value = ready_probe
+
+                sb._wait_for_ready()  # should not raise
+
+    def test_raises_when_caido_never_starts(self):
+        """Should raise SandboxError if Caido never responds."""
         with patch("docker.from_env") as mock_docker:
             mock_docker.return_value = MagicMock()
             sb = Sandbox()
-            sb._container = None
+            sb._container = MagicMock()
 
-            with pytest.raises(SandboxError) as exc_info:
-                sb._initialize_container()
-            assert "Container not started" in str(exc_info.value)
+            with patch("httpx.Client") as mock_client_class:
+                mock_client = MagicMock()
+                mock_client_class.return_value.__enter__.return_value = mock_client
+                mock_client.get.side_effect = Exception("connection refused")
 
+                with patch.object(sandbox, "CONTAINER_HEALTH_RETRIES", 2):
+                    with patch("time.sleep"):
+                        with pytest.raises(SandboxError) as exc_info:
+                            sb._wait_for_ready()
+                        assert "Caido" in str(exc_info.value)
 
-class TestWaitForHealth:
-    """Tests for _wait_for_health method."""
-
-    def test_returns_when_healthy(self):
-        """Should return when server is healthy."""
+    def test_raises_when_proxy_sh_never_appears(self):
+        """Should raise SandboxError if proxy.sh never lands."""
         with patch("docker.from_env") as mock_docker:
             mock_docker.return_value = MagicMock()
+            mock_container = MagicMock()
             sb = Sandbox()
+            sb._container = mock_container
 
             with patch("httpx.Client") as mock_client_class:
                 mock_client = MagicMock()
                 mock_client_class.return_value.__enter__.return_value = mock_client
                 mock_response = MagicMock()
-                mock_response.json.return_value = {"status": "healthy"}
+                mock_response.status_code = 200
                 mock_client.get.return_value = mock_response
 
-                # Should not raise
-                sb._wait_for_health("http://localhost:8080/health")
+                not_ready = MagicMock()
+                not_ready.exit_code = 1  # `test -f` fails every time
+                mock_container.exec_run.return_value = not_ready
 
-    def test_raises_error_after_retries(self):
-        """Should raise SandboxError after all retries fail."""
-        with patch("docker.from_env") as mock_docker:
-            mock_docker.return_value = MagicMock()
-            sb = Sandbox()
-
-            with patch("httpx.Client") as mock_client_class:
-                mock_client = MagicMock()
-                mock_client_class.return_value.__enter__.return_value = mock_client
-                mock_client.get.side_effect = Exception("Connection refused")
-
-                with patch.object(sandbox, "TOOL_SERVER_HEALTH_RETRIES", 2):
-                    with patch("time.sleep"):  # Speed up test
+                with patch.object(sandbox, "CONTAINER_HEALTH_RETRIES", 2):
+                    with patch("time.sleep"):
                         with pytest.raises(SandboxError) as exc_info:
-                            sb._wait_for_health("http://localhost:8080/health")
-                        assert "failed to start" in str(exc_info.value)
+                            sb._wait_for_ready()
+                        assert "entrypoint" in str(exc_info.value)
 
 
 class TestCopyLocalSources:
@@ -637,7 +628,7 @@ class TestContainerConfiguration:
             mock_client.containers.get.side_effect = NotFound("Not found")
 
             with patch.object(Sandbox, "ensure_image"):
-                with patch.object(Sandbox, "_initialize_container"):
+                with patch.object(Sandbox, "_wait_for_ready"):
                     with patch.object(Sandbox, "_find_available_port", return_value=8080):
                         sb = Sandbox()
                         sb.start()
@@ -657,7 +648,7 @@ class TestContainerConfiguration:
             mock_client.containers.get.side_effect = NotFound("Not found")
 
             with patch.object(Sandbox, "ensure_image"):
-                with patch.object(Sandbox, "_initialize_container"):
+                with patch.object(Sandbox, "_wait_for_ready"):
                     with patch.object(Sandbox, "_find_available_port", return_value=8080):
                         sb = Sandbox(scan_id="my-scan")
                         sb.start()
@@ -667,7 +658,7 @@ class TestContainerConfiguration:
                         assert labels.get("strix-cli-scan-id") == "my-scan"
 
     def test_container_exposes_ports(self):
-        """Should expose Caido and tool server ports."""
+        """Should expose only the Caido host port (tool server is gone in 1.0.0)."""
         with patch("docker.from_env") as mock_docker:
             mock_client = MagicMock()
             mock_docker.return_value = mock_client
@@ -677,34 +668,66 @@ class TestContainerConfiguration:
             mock_client.containers.get.side_effect = NotFound("Not found")
 
             with patch.object(Sandbox, "ensure_image"):
-                with patch.object(Sandbox, "_initialize_container"):
-                    with patch.object(Sandbox, "_find_available_port", side_effect=[8080, 9090]):
-                        sb = Sandbox()
-                        sb.start()
-
-                        call_kwargs = mock_client.containers.run.call_args[1]
-                        ports = call_kwargs.get("ports", {})
-                        assert "8080/tcp" in ports
-                        assert "9090/tcp" in ports
-
-    def test_container_uses_sleep_infinity(self):
-        """Should use 'sleep infinity' as command."""
-        with patch("docker.from_env") as mock_docker:
-            mock_client = MagicMock()
-            mock_docker.return_value = mock_client
-            mock_container = MagicMock()
-            mock_container.id = "container123"
-            mock_client.containers.run.return_value = mock_container
-            mock_client.containers.get.side_effect = NotFound("Not found")
-
-            with patch.object(Sandbox, "ensure_image"):
-                with patch.object(Sandbox, "_initialize_container"):
+                with patch.object(Sandbox, "_wait_for_ready"):
                     with patch.object(Sandbox, "_find_available_port", return_value=8080):
                         sb = Sandbox()
                         sb.start()
 
                         call_kwargs = mock_client.containers.run.call_args[1]
-                        assert call_kwargs.get("command") == "sleep infinity"
+                        ports = call_kwargs.get("ports", {})
+                        # Caido listens on a fixed port inside the container and is
+                        # published to the host's chosen port - the only mapping.
+                        assert f"{sandbox.CAIDO_CONTAINER_PORT}/tcp" in ports
+                        assert ports[f"{sandbox.CAIDO_CONTAINER_PORT}/tcp"] == 8080
+                        # No tool server port anymore.
+                        assert len(ports) == 1
+
+    def test_container_uses_keepalive_command(self):
+        """Should use 'tail -f /dev/null' as the keep-alive command.
+
+        The 1.0.0 image's own docker-entrypoint.sh runs the Caido/CA/proxy
+        setup before `exec "$@"`, so we no longer override entrypoint with
+        `sleep infinity` and run the init ourselves.
+        """
+        with patch("docker.from_env") as mock_docker:
+            mock_client = MagicMock()
+            mock_docker.return_value = mock_client
+            mock_container = MagicMock()
+            mock_container.id = "container123"
+            mock_client.containers.run.return_value = mock_container
+            mock_client.containers.get.side_effect = NotFound("Not found")
+
+            with patch.object(Sandbox, "ensure_image"):
+                with patch.object(Sandbox, "_wait_for_ready"):
+                    with patch.object(Sandbox, "_find_available_port", return_value=8080):
+                        sb = Sandbox()
+                        sb.start()
+
+                        call_kwargs = mock_client.containers.run.call_args[1]
+                        assert call_kwargs.get("command") == ["tail", "-f", "/dev/null"]
+                        # No entrypoint override - let the image bring up Caido.
+                        assert call_kwargs.get("entrypoint", "") == ""
+
+    def test_container_only_maps_caido_port(self):
+        """Should map only the Caido host port (tool server is gone in 1.0.0)."""
+        with patch("docker.from_env") as mock_docker:
+            mock_client = MagicMock()
+            mock_docker.return_value = mock_client
+            mock_container = MagicMock()
+            mock_container.id = "container123"
+            mock_client.containers.run.return_value = mock_container
+            mock_client.containers.get.side_effect = NotFound("Not found")
+
+            with patch.object(Sandbox, "ensure_image"):
+                with patch.object(Sandbox, "_wait_for_ready"):
+                    with patch.object(Sandbox, "_find_available_port", return_value=8080):
+                        sb = Sandbox()
+                        sb.start()
+
+                        call_kwargs = mock_client.containers.run.call_args[1]
+                        ports = call_kwargs.get("ports", {})
+                        assert f"{sandbox.CAIDO_CONTAINER_PORT}/tcp" in ports
+                        assert ports[f"{sandbox.CAIDO_CONTAINER_PORT}/tcp"] == 8080
 
 
 class TestDockerSocketMounting:
@@ -757,7 +780,7 @@ class TestDockerSocketMounting:
             mock_client.containers.get.side_effect = NotFound("Not found")
 
             with patch.object(Sandbox, "ensure_image"):
-                with patch.object(Sandbox, "_initialize_container"):
+                with patch.object(Sandbox, "_wait_for_ready"):
                     with patch.object(Sandbox, "_find_available_port", return_value=8080):
                         with patch.object(Path, "exists", return_value=True):
                             sb = Sandbox(mount_docker_socket=True)
@@ -780,7 +803,7 @@ class TestDockerSocketMounting:
             mock_client.containers.get.side_effect = NotFound("Not found")
 
             with patch.object(Sandbox, "ensure_image"):
-                with patch.object(Sandbox, "_initialize_container"):
+                with patch.object(Sandbox, "_wait_for_ready"):
                     with patch.object(Sandbox, "_find_available_port", return_value=8080):
                         sb = Sandbox(mount_docker_socket=False)
                         sb.start()
@@ -801,7 +824,7 @@ class TestDockerSocketMounting:
             mock_client.containers.get.side_effect = NotFound("Not found")
 
             with patch.object(Sandbox, "ensure_image"):
-                with patch.object(Sandbox, "_initialize_container"):
+                with patch.object(Sandbox, "_wait_for_ready"):
                     with patch.object(Sandbox, "_find_available_port", return_value=8080):
                         with patch.object(Path, "exists", return_value=True):
                             sb = Sandbox(mount_docker_socket=True)
@@ -822,7 +845,7 @@ class TestDockerSocketMounting:
             mock_client.containers.get.side_effect = NotFound("Not found")
 
             with patch.object(Sandbox, "ensure_image"):
-                with patch.object(Sandbox, "_initialize_container"):
+                with patch.object(Sandbox, "_wait_for_ready"):
                     with patch.object(Sandbox, "_find_available_port", return_value=8080):
                         sb = Sandbox(mount_docker_socket=False)
                         sb.start()

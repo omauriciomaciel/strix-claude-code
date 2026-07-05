@@ -9,114 +9,102 @@ import pytest
 
 from strix_cli_claude import mcp_server
 from strix_cli_claude.mcp_server import (
-    ToolServerClient,
+    SandboxExecClient,
     PENTEST_TOOLS,
     create_server,
     calculate_cvss,
 )
 
 
-class TestToolServerClient:
-    """Tests for ToolServerClient class."""
+class TestSandboxExecClient:
+    """Tests for SandboxExecClient - the docker-exec replacement for the old
+    HTTP ToolServerClient that strix-sandbox 1.0.0 dropped."""
 
-    def test_init_sets_attributes(self):
-        """Should initialize with provided attributes."""
-        client = ToolServerClient(
-            base_url="http://localhost:8080",
-            token="secret-token",
-            agent_id="test-agent",
+    def _make_client(self, mock_container):
+        """Build a SandboxExecClient with a mocked docker lookup."""
+        with patch("docker.from_env") as mock_from_env:
+            mock_client = MagicMock()
+            mock_client.containers.get.return_value = mock_container
+            mock_from_env.return_value = mock_client
+            client = SandboxExecClient("strix-cli-test")
+            # Force container resolution via the mock instead of real docker.
+            client._container = mock_container
+            return client
+
+    def test_init_sets_container_name(self):
+        """Should store the container name for later docker lookups."""
+        client = SandboxExecClient("strix-cli-test")
+        assert client.container_name == "strix-cli-test"
+
+    @pytest.mark.asyncio
+    async def test_terminal_execute_runs_bash(self):
+        """terminal_execute should shell out via `docker exec bash -lc`."""
+        mock_container = MagicMock()
+        result_obj = MagicMock(exit_code=0, output=b"uid=0(root)")
+        mock_container.exec_run.return_value = result_obj
+
+        client = self._make_client(mock_container)
+        result = await client.call_tool("terminal_execute", {"command": "id"})
+
+        mock_container.exec_run.assert_called_once()
+        args, kwargs = mock_container.exec_run.call_args
+        assert args[0] == ["bash", "-lc", "id"]
+        assert kwargs.get("workdir") == "/workspace"
+        assert kwargs.get("user") == "pentester"
+        assert "result" in result
+        assert result["result"]["exit_code"] == 0
+        assert "uid=0(root)" in result["result"]["content"]
+
+    @pytest.mark.asyncio
+    async def test_terminal_execute_respects_timeout(self):
+        """Should return an error dict when exec_run times out."""
+        from concurrent.futures import TimeoutError as FuturesTimeoutError
+
+        mock_container = MagicMock()
+
+        def slow_exec(*args, **kwargs):
+            import time
+            time.sleep(10)
+
+        mock_container.exec_run.side_effect = slow_exec
+
+        client = self._make_client(mock_container)
+        result = await client.call_tool(
+            "terminal_execute", {"command": "sleep 100", "timeout": 1}
         )
 
-        assert client.base_url == "http://localhost:8080"
-        assert client.token == "secret-token"
-        assert client.agent_id == "test-agent"
-
-    def test_init_creates_httpx_client(self):
-        """Should create httpx client with correct headers."""
-        with patch("httpx.AsyncClient") as mock_client:
-            ToolServerClient(
-                base_url="http://localhost:8080",
-                token="secret-token",
-                agent_id="test-agent",
-            )
-
-            mock_client.assert_called_once()
-            call_kwargs = mock_client.call_args[1]
-            assert call_kwargs["base_url"] == "http://localhost:8080"
-            assert call_kwargs["headers"]["Authorization"] == "Bearer secret-token"
-            assert call_kwargs["timeout"] == 300.0
+        assert "error" in result
+        assert "timed out" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_call_tool_posts_to_execute(self):
-        """Should POST to /execute endpoint."""
-        with patch("httpx.AsyncClient") as mock_client_class:
-            mock_client = MagicMock()
-            mock_client_class.return_value = mock_client
-            mock_response = MagicMock()
-            mock_response.json.return_value = {"result": "success"}
-            mock_client.post = AsyncMock(return_value=mock_response)
+    async def test_browser_tools_are_unsupported(self):
+        """The HTTP tool server that exposed browser/Caido tools is gone in
+        1.0.0; SandboxExecClient should report that explicitly."""
+        mock_container = MagicMock()
+        client = self._make_client(mock_container)
 
-            client = ToolServerClient("http://localhost:8080", "token", "agent-1")
-            result = await client.call_tool("terminal_execute", {"command": "ls"})
-
-            mock_client.post.assert_called_once_with(
-                "/execute",
-                json={
-                    "tool_name": "terminal_execute",
-                    "kwargs": {"command": "ls"},
-                    "agent_id": "agent-1",
-                },
-            )
-            assert result == {"result": "success"}
-
-    @pytest.mark.asyncio
-    async def test_call_tool_handles_http_error(self):
-        """Should handle HTTP errors gracefully."""
-        import httpx
-
-        with patch("httpx.AsyncClient") as mock_client_class:
-            mock_client = MagicMock()
-            mock_client_class.return_value = mock_client
-
-            mock_response = MagicMock()
-            mock_response.status_code = 500
-            mock_response.text = "Internal Server Error"
-
-            error = httpx.HTTPStatusError("error", request=MagicMock(), response=mock_response)
-            mock_client.post = AsyncMock(side_effect=error)
-
-            client = ToolServerClient("http://localhost:8080", "token", "agent-1")
-            result = await client.call_tool("terminal_execute", {"command": "ls"})
-
+        for tool in ("browser_action", "list_requests", "view_request",
+                     "send_request", "repeat_request"):
+            result = await client.call_tool(tool, {})
             assert "error" in result
-            assert "500" in result["error"]
+            assert "1.0.0" in result["error"] or "isn't available" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_call_tool_handles_generic_error(self):
-        """Should handle generic errors gracefully."""
-        with patch("httpx.AsyncClient") as mock_client_class:
-            mock_client = MagicMock()
-            mock_client_class.return_value = mock_client
-            mock_client.post = AsyncMock(side_effect=Exception("Connection failed"))
+    async def test_unknown_tool_returns_error(self):
+        """Unknown tool names should resolve to an error dict."""
+        mock_container = MagicMock()
+        client = self._make_client(mock_container)
 
-            client = ToolServerClient("http://localhost:8080", "token", "agent-1")
-            result = await client.call_tool("terminal_execute", {"command": "ls"})
-
-            assert "error" in result
-            assert "Connection failed" in result["error"]
+        result = await client.call_tool("does_not_exist", {})
+        assert "error" in result
+        assert "Unknown tool" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_close_closes_client(self):
-        """Should close the httpx client."""
-        with patch("httpx.AsyncClient") as mock_client_class:
-            mock_client = MagicMock()
-            mock_client.aclose = AsyncMock()
-            mock_client_class.return_value = mock_client
-
-            client = ToolServerClient("http://localhost:8080", "token", "agent-1")
-            await client.close()
-
-            mock_client.aclose.assert_called_once()
+    async def test_close_is_a_noop(self):
+        """SandboxExecClient.close() is a no-op (no httpx client to close)."""
+        client = SandboxExecClient("strix-cli-test")
+        # Should not raise.
+        await client.close()
 
 
 class TestPentestTools:
@@ -532,58 +520,69 @@ class TestNotesStorage:
         assert results[0]["title"] == "XSS Finding"
 
 
-class TestToolServerClientUnit:
-    """Unit tests for ToolServerClient."""
+class TestSandboxExecClientUnit:
+    """Unit tests for SandboxExecClient (docker-exec based)."""
 
     @pytest.mark.asyncio
-    async def test_call_tool_returns_result(self):
-        """Should return result from tool server."""
-        with patch("httpx.AsyncClient") as mock_client_class:
-            mock_client = MagicMock()
-            mock_client_class.return_value = mock_client
-            mock_response = MagicMock()
-            mock_response.json.return_value = {"result": {"content": "output"}}
-            mock_client.post = AsyncMock(return_value=mock_response)
+    async def test_call_tool_terminal_execute_propagates_exit_code(self):
+        """Non-zero exit codes should still return content + exit_code."""
+        mock_container = MagicMock()
+        result_obj = MagicMock(exit_code=2, output=b"command not found")
+        mock_container.exec_run.return_value = result_obj
 
-            client = ToolServerClient("http://localhost:8080", "token", "agent")
-            result = await client.call_tool("test_tool", {"arg": "value"})
+        client = SandboxExecClient("strix-cli-test")
+        client._container = mock_container  # bypass docker.from_env
 
-            assert result["result"]["content"] == "output"
+        result = await client.call_tool("terminal_execute", {"command": "nope"})
+        assert result["result"]["exit_code"] == 2
+        assert "command not found" in result["result"]["content"]
 
     @pytest.mark.asyncio
-    async def test_call_tool_sends_correct_payload(self):
-        """Should send correct payload to tool server."""
-        with patch("httpx.AsyncClient") as mock_client_class:
-            mock_client = MagicMock()
-            mock_client_class.return_value = mock_client
-            mock_response = MagicMock()
-            mock_response.json.return_value = {}
-            mock_client.post = AsyncMock(return_value=mock_response)
+    async def test_call_tool_python_action_runs_python(self):
+        """python_action with action=execute should run python3 in the sandbox."""
+        mock_container = MagicMock()
+        result_obj = MagicMock(exit_code=0, output=b"6")
+        mock_container.exec_run.return_value = result_obj
 
-            client = ToolServerClient("http://localhost:8080", "token", "my-agent")
-            await client.call_tool("terminal_execute", {"command": "ls -la"})
+        client = SandboxExecClient("strix-cli-test")
+        client._container = mock_container
 
-            mock_client.post.assert_called_with(
-                "/execute",
-                json={
-                    "tool_name": "terminal_execute",
-                    "kwargs": {"command": "ls -la"},
-                    "agent_id": "my-agent",
-                }
-            )
+        result = await client.call_tool(
+            "python_action", {"action": "execute", "code": "print(2 + 4)"}
+        )
+        assert result["result"]["exit_code"] == 0
+        assert "6" in result["result"]["content"]
+        # Should have exec'd python3 (first call); the trailing call is just `rm`.
+        first_call = mock_container.exec_run.call_args_list[0]
+        called_cmd = first_call[0][0]
+        assert called_cmd == ["python3", first_call[0][0][1]] or called_cmd[0] == "python3"
+
+    @pytest.mark.asyncio
+    async def test_call_tool_python_action_action_not_execute_is_noop(self):
+        """Non-execute python_action actions are documented no-ops."""
+        mock_container = MagicMock()
+        client = SandboxExecClient("strix-cli-test")
+        client._container = mock_container
+
+        result = await client.call_tool(
+            "python_action", {"action": "store", "code": "x"}
+        )
+        assert "result" in result
+        assert "no-op" in result["result"]["content"].lower()
+        # Nothing should have been exec'd in the container.
+        mock_container.exec_run.assert_not_called()
 
 
 class TestEnvironmentVariables:
     """Tests for environment variable handling."""
 
-    def test_tool_server_url_from_env(self):
-        """Should read TOOL_SERVER_URL from environment."""
-        with patch.dict("os.environ", {"STRIX_TOOL_SERVER_URL": "http://custom:9000"}):
-            # Reimport to pick up new env var
+    def test_sandbox_container_from_env(self):
+        """mcp_server should expose STRIX_SANDBOX_CONTAINER (legacy TOOL_SERVER_* gone)."""
+        with patch.dict("os.environ", {"STRIX_SANDBOX_CONTAINER": "strix-cli-custom"}):
             import importlib
             importlib.reload(mcp_server)
-            assert mcp_server.TOOL_SERVER_URL == "http://custom:9000"
-            # Reset
+            assert mcp_server.SANDBOX_CONTAINER == "strix-cli-custom"
+            assert not getattr(mcp_server, "TOOL_SERVER_URL", "")
             importlib.reload(mcp_server)
 
     def test_agent_id_default(self):

@@ -190,41 +190,38 @@ class TestCreateMcpConfig:
     def test_returns_dict_with_mcp_servers(self):
         """Should return config with mcpServers key."""
         result = main.create_mcp_config(
-            "http://localhost:8080",
-            "token123",
+            "strix-cli-scan-abc",
             "scan-abc",
             "/path/to/report.md"
         )
         assert "mcpServers" in result
         assert "strix-pentest" in result["mcpServers"]
 
-    def test_config_includes_tool_server_url(self):
-        """Should include tool server URL in env."""
+    def test_config_includes_sandbox_container(self):
+        """Should include sandbox container name in env."""
         result = main.create_mcp_config(
-            "http://localhost:8080",
-            "token123",
+            "strix-cli-scan-abc",
             "scan-abc",
             "/path/to/report.md"
         )
         env = result["mcpServers"]["strix-pentest"]["env"]
-        assert env["STRIX_TOOL_SERVER_URL"] == "http://localhost:8080"
+        assert env["STRIX_SANDBOX_CONTAINER"] == "strix-cli-scan-abc"
 
-    def test_config_includes_token(self):
-        """Should include auth token in env."""
+    def test_config_does_not_include_tool_server_env(self):
+        """Should not leak the legacy tool-server env vars."""
         result = main.create_mcp_config(
-            "http://localhost:8080",
-            "secret-token",
+            "strix-cli-scan-abc",
             "scan-abc",
             "/path/to/report.md"
         )
         env = result["mcpServers"]["strix-pentest"]["env"]
-        assert env["STRIX_TOOL_SERVER_TOKEN"] == "secret-token"
+        assert "STRIX_TOOL_SERVER_URL" not in env
+        assert "STRIX_TOOL_SERVER_TOKEN" not in env
 
     def test_config_includes_scan_id(self):
         """Should include scan ID in agent ID."""
         result = main.create_mcp_config(
-            "http://localhost:8080",
-            "token123",
+            "strix-cli-my-scan-123",
             "my-scan-123",
             "/path/to/report.md"
         )
@@ -234,8 +231,7 @@ class TestCreateMcpConfig:
     def test_config_includes_report_file(self):
         """Should include report file path."""
         result = main.create_mcp_config(
-            "http://localhost:8080",
-            "token123",
+            "strix-cli-scan-abc",
             "scan-abc",
             "/custom/report/path.md"
         )
@@ -246,8 +242,7 @@ class TestCreateMcpConfig:
         """Should use current Python executable."""
         import sys
         result = main.create_mcp_config(
-            "http://localhost:8080",
-            "token123",
+            "strix-cli-scan-abc",
             "scan-abc",
             "/path/to/report.md"
         )
@@ -294,8 +289,7 @@ class TestMainCli:
                 mock_instance = MagicMock()
                 mock_instance.start.return_value = {
                     "container_name": "test",
-                    "tool_server_url": "http://localhost:8080",
-                    "tool_server_token": "token",
+                    "caido_port": 38080,
                     "scan_id": "abc123",
                     "cpu_count": 4,
                 }
@@ -324,8 +318,7 @@ class TestMainCli:
                 mock_instance = MagicMock()
                 mock_instance.start.return_value = {
                     "container_name": "test",
-                    "tool_server_url": "http://localhost:8080",
-                    "tool_server_token": "token",
+                    "caido_port": 38080,
                     "scan_id": "abc123",
                     "cpu_count": 4,
                 }
@@ -356,8 +349,7 @@ class TestMainCli:
                 mock_instance = MagicMock()
                 mock_instance.start.return_value = {
                     "container_name": "test",
-                    "tool_server_url": "http://localhost:8080",
-                    "tool_server_token": "token",
+                    "caido_port": 38080,
                     "scan_id": "abc123",
                     "cpu_count": 4,
                 }
@@ -490,11 +482,13 @@ class TestParallelSubagentSupport:
         assert "Task tool" in result or "Task(" in result
 
     def test_system_prompt_includes_strix_tool_usage(self):
-        """System prompt should show how to use /tmp/strix-tool."""
+        """System prompt should show how to use /tmp/strix-tool (docker exec)."""
         result = main.get_system_prompt("URL: https://example.com", "deep", 4)
 
-        assert "strix-tool terminal_execute" in result
-        assert "command" in result
+        assert "/tmp/strix-tool" in result
+        # The helper now docker-execs a shell command (no tool-server JSON).
+        assert "strix-tool nmap" in result
+        assert "docker exec" not in result  # the wrapper hides that detail
 
     def test_system_prompt_includes_parallel_strategy_examples(self):
         """System prompt should include examples of parallel agent strategies."""
@@ -515,8 +509,7 @@ class TestParallelSubagentSupport:
                 mock_instance = MagicMock()
                 mock_instance.start.return_value = {
                     "container_name": "test",
-                    "tool_server_url": "http://localhost:9999",
-                    "tool_server_token": "test-token-123",
+                    "caido_port": 39999,
                     "scan_id": "abc123",
                     "cpu_count": 4,
                 }
@@ -550,15 +543,20 @@ class TestParallelSubagentSupport:
                         with patch("time.sleep", side_effect=KeyboardInterrupt):
                             result = runner.invoke(main.main, ["-t", "example.com"])
 
-                # Check that helper script was created
+                # The helper script now uses `docker exec` (no tool server creds).
                 helper_script = Path("/tmp/strix-tool")
                 if helper_script.exists():
                     content = helper_script.read_text()
-                    assert "curl" in content
-                    assert "execute" in content
+                    assert "docker exec" in content
+                    assert "curl" not in content
 
-    def test_credentials_file_created_on_scan_start(self, tmp_path):
-        """Credentials file should be created when scan starts."""
+    def test_no_legacy_credentials_file_on_scan_start(self, tmp_path):
+        """The old /tmp/strix-tool-server.env credentials file must NOT be created.
+
+        The 1.0.0 rewrite moved away from the in-container HTTP tool server: the
+        helper script just shells out via `docker exec`, so there are no tool
+        server credentials to write.
+        """
         from click.testing import CliRunner
         runner = CliRunner()
 
@@ -567,8 +565,7 @@ class TestParallelSubagentSupport:
                 mock_instance = MagicMock()
                 mock_instance.start.return_value = {
                     "container_name": "test",
-                    "tool_server_url": "http://localhost:9999",
-                    "tool_server_token": "test-token-123",
+                    "caido_port": 39999,
                     "scan_id": "abc123",
                     "cpu_count": 4,
                 }
@@ -580,12 +577,11 @@ class TestParallelSubagentSupport:
                         with patch("time.sleep", side_effect=KeyboardInterrupt):
                             result = runner.invoke(main.main, ["-t", "example.com"])
 
-                # Check that credentials file was created
+                # Legacy credentials file should not be written by this build.
                 creds_file = Path("/tmp/strix-tool-server.env")
                 if creds_file.exists():
                     content = creds_file.read_text()
-                    assert "STRIX_TOOL_URL" in content
-                    assert "STRIX_TOOL_TOKEN" in content
+                    assert "STRIX_TOOL_TOKEN" not in content
 
 
 class TestDockerSystemPrompt:
@@ -688,8 +684,7 @@ class TestScanIdIntegration:
                 mock_instance = MagicMock()
                 mock_instance.start.return_value = {
                     "container_name": "strix-cli-testid123",
-                    "tool_server_url": "http://localhost:9999",
-                    "tool_server_token": "test-token",
+                    "caido_port": 39999,
                     "scan_id": "testid123",
                     "cpu_count": 4,
                 }
@@ -721,8 +716,7 @@ class TestScanIdIntegration:
                 mock_instance = MagicMock()
                 mock_instance.start.return_value = {
                     "container_name": "strix-cli-auto123",
-                    "tool_server_url": "http://localhost:9999",
-                    "tool_server_token": "test-token",
+                    "caido_port": 39999,
                     "scan_id": "auto123",
                     "cpu_count": 4,
                 }
