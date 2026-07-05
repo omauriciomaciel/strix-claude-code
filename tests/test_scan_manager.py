@@ -583,7 +583,7 @@ class TestStopDockerContainer:
             assert result is False
 
     def test_stops_and_removes_container(self):
-        """Should stop and remove container when it exists."""
+        """Should SIGKILL and remove container when it exists (v1.0.4 PR #548)."""
         mock_result = MagicMock()
         mock_result.stdout = "abc123\n"
 
@@ -591,10 +591,14 @@ class TestStopDockerContainer:
             result = scan_manager.stop_docker_container("scanid")
 
             assert result is True
-            # Check docker stop and rm were called
+            # Check docker kill (SIGKILL, not graceful stop) and rm were called.
             calls = [c[0][0] for c in mock_run.call_args_list]
-            assert ["docker", "stop", "strix-cli-scanid"] in calls
+            assert ["docker", "kill", "strix-cli-scanid"] in calls
             assert ["docker", "rm", "-f", "strix-cli-scanid"] in calls
+            # No graceful `docker stop` should be issued anymore.
+            assert not any(
+                c[0] == ["docker", "stop", "strix-cli-scanid"] for c in calls
+            )
 
 
 class TestStopScan:
@@ -821,18 +825,24 @@ class TestDeleteScan:
             with patch("subprocess.run", side_effect=mock_subprocess_run):
                 scan_manager.delete_scan("dockertest123")
 
-        # Verify Docker stop and rm commands were called with correct container name
-        docker_stop_called = any(
-            cmd[0] == "docker" and cmd[1] == "stop" and "strix-cli-dockertest123" in cmd
+        # Verify Docker kill (SIGKILL per v1.0.4) and rm were called with the
+        # correct container name. We no longer issue a graceful `docker stop`.
+        docker_kill_called = any(
+            cmd[0] == "docker" and cmd[1] == "kill" and "strix-cli-dockertest123" in cmd
             for cmd in subprocess_calls
         )
         docker_rm_called = any(
             cmd[0] == "docker" and cmd[1] == "rm" and "strix-cli-dockertest123" in cmd
             for cmd in subprocess_calls
         )
+        docker_stop_called = any(
+            cmd[0] == "docker" and cmd[1] == "stop" and "strix-cli-dockertest123" in cmd
+            for cmd in subprocess_calls
+        )
 
-        assert docker_stop_called, f"docker stop not called with correct container name. Calls: {subprocess_calls}"
+        assert docker_kill_called, f"docker kill not called with correct container name. Calls: {subprocess_calls}"
         assert docker_rm_called, f"docker rm not called with correct container name. Calls: {subprocess_calls}"
+        assert not docker_stop_called, f"graceful docker stop should not be issued anymore. Calls: {subprocess_calls}"
 
     def test_delete_stops_docker_even_when_screen_not_running(self, tmp_path):
         """Should stop Docker container even when screen session is not running."""
@@ -862,13 +872,14 @@ class TestDeleteScan:
             with patch("subprocess.run", side_effect=mock_subprocess_run):
                 scan_manager.delete_scan("orphanedcontainer")
 
-        # Docker stop should still be called
-        docker_stop_called = any(
-            cmd[0] == "docker" and cmd[1] == "stop" and "strix-cli-orphanedcontainer" in cmd
+        # Docker kill (SIGKILL per v1.0.4) should still be called for the orphaned
+        # container even when no screen session is running.
+        docker_kill_called = any(
+            cmd[0] == "docker" and cmd[1] == "kill" and "strix-cli-orphanedcontainer" in cmd
             for cmd in subprocess_calls
         )
 
-        assert docker_stop_called, f"docker stop not called for orphaned container. Calls: {subprocess_calls}"
+        assert docker_kill_called, f"docker kill not called for orphaned container. Calls: {subprocess_calls}"
 
     def test_delete_uses_correct_container_name_format(self, tmp_path):
         """Verify delete_scan uses the correct container name format: strix-cli-{scan_id}."""
@@ -893,8 +904,8 @@ class TestDeleteScan:
                         if arg.startswith("name="):
                             container_names_used.append(arg.split("=")[1])
                     result.stdout = "abc123\n"
-                # docker stop <container_name>
-                elif cmd[1] == "stop" and len(cmd) >= 3:
+                # docker kill <container_name> (SIGKILL, v1.0.4)
+                elif cmd[1] == "kill" and len(cmd) >= 3:
                     container_names_used.append(cmd[2])
                 # docker rm -f <container_name>
                 elif cmd[1] == "rm" and len(cmd) >= 4:

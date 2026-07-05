@@ -248,6 +248,38 @@ class TestCreateMcpConfig:
         )
         assert result["mcpServers"]["strix-pentest"]["command"] == sys.executable
 
+    def test_config_includes_caido_url(self):
+        """Should set STRIX_CAIDO_URL when caido_url param is provided."""
+        result = main.create_mcp_config(
+            "strix-cli-scan-abc",
+            "scan-abc",
+            "/path/to/report.md",
+            caido_url="http://127.0.0.1:48080",
+        )
+        env = result["mcpServers"]["strix-pentest"]["env"]
+        assert env["STRIX_CAIDO_URL"] == "http://127.0.0.1:48080"
+
+    def test_config_omits_caido_url_when_none(self):
+        """Should not set STRIX_CAIDO_URL when caido_url is omitted."""
+        result = main.create_mcp_config(
+            "strix-cli-scan-abc",
+            "scan-abc",
+            "/path/to/report.md",
+        )
+        env = result["mcpServers"]["strix-pentest"]["env"]
+        assert "STRIX_CAIDO_URL" not in env
+
+    def test_config_omits_caido_url_when_empty(self):
+        """Should not set STRIX_CAIDO_URL when caido_url is empty string."""
+        result = main.create_mcp_config(
+            "strix-cli-scan-abc",
+            "scan-abc",
+            "/path/to/report.md",
+            caido_url="",
+        )
+        env = result["mcpServers"]["strix-pentest"]["env"]
+        assert "STRIX_CAIDO_URL" not in env
+
 
 class TestCheckClaudeCli:
     """Tests for check_claude_cli function."""

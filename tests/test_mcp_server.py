@@ -77,17 +77,34 @@ class TestSandboxExecClient:
         assert "timed out" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_browser_tools_are_unsupported(self):
-        """The HTTP tool server that exposed browser/Caido tools is gone in
-        1.0.0; SandboxExecClient should report that explicitly."""
+    async def test_browser_tools_route_to_agent_browser_or_caido(self):
+        """Since 1.0.0 we wire browser_action -> agent-browser and the proxy
+        tools -> Caido GraphQL. Calling them with no args should fail with a
+        domain-specific error (NOT the old 'isn't available' message)."""
         mock_container = MagicMock()
         client = self._make_client(mock_container)
 
-        for tool in ("browser_action", "list_requests", "view_request",
-                     "send_request", "repeat_request"):
-            result = await client.call_tool(tool, {})
-            assert "error" in result
-            assert "1.0.0" in result["error"] or "isn't available" in result["error"]
+        # browser_action with no `action` -> contract error, not 'unsupported'.
+        result = await client.call_tool("browser_action", {})
+        assert "error" in result
+        assert "requires 'action'" in result["error"]
+        # The old 'isn't available' / '1.0.0' message must be gone.
+        assert "isn't available" not in result["error"]
+
+        # view_request with no request_id -> contract error from the GraphQL path.
+        # Avoid the real Caido bootstrap by stubbing _get_caido.
+        client._caido = MagicMock()
+        client._caido.view_request = AsyncMock(return_value={"request": {}})
+        result = await client.call_tool("view_request", {})
+        assert "error" in result
+        assert "request_id" in result["error"]
+        assert "isn't available" not in result["error"]
+
+        # send_request with no url -> contract error.
+        result = await client.call_tool("send_request", {})
+        assert "error" in result
+        assert "url" in result["error"]
+        assert "isn't available" not in result["error"]
 
     @pytest.mark.asyncio
     async def test_unknown_tool_returns_error(self):
@@ -100,11 +117,262 @@ class TestSandboxExecClient:
         assert "Unknown tool" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_close_is_a_noop(self):
-        """SandboxExecClient.close() is a no-op (no httpx client to close)."""
+    async def test_close_is_a_noop_when_no_caido(self):
+        """SandboxExecClient.close() is a no-op when no Caido client was created."""
         client = SandboxExecClient("strix-cli-test")
         # Should not raise.
         await client.close()
+
+    @pytest.mark.asyncio
+    async def test_close_releases_caido_client(self):
+        """close() should tear down the Caido client if one was bootstrapped."""
+        client = SandboxExecClient("strix-cli-test")
+        mock_caido = MagicMock()
+        mock_caido.close = AsyncMock()
+        client._caido = mock_caido
+        await client.close()
+        mock_caido.close.assert_called_once()
+        assert client._caido is None
+
+
+# --------------------------------------------------------------------------- #
+# browser_action -> agent-browser argv routing (parametrized)
+# --------------------------------------------------------------------------- #
+
+
+class TestBrowserActionRouting:
+    """Each MCP browser_action subcommand must map to the right agent-browser argv."""
+
+    def _make_client(self, mock_container):
+        with patch("docker.from_env") as mock_from_env:
+            mock_client = MagicMock()
+            mock_client.containers.get.return_value = mock_container
+            mock_from_env.return_value = mock_client
+            client = SandboxExecClient("strix-cli-test")
+            client._container = mock_container
+            return client
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "params, expected_subcommand",
+        [
+            ({"action": "launch"}, ["open"]),
+            ({"action": "launch", "url": "https://x.com"}, ["open", "https://x.com"]),
+            ({"action": "goto", "url": "https://y.com"}, ["open", "https://y.com"]),
+            ({"action": "click", "selector": "#btn"}, ["click", "#btn"]),
+            ({"action": "click", "selector": "@e2"}, ["click", "@e2"]),
+            ({"action": "type", "selector": "#q", "text": "hi"}, ["type", "#q", "hi"]),
+            ({"action": "scroll", "direction": "down"}, ["scroll", "down"]),
+            ({"action": "scroll", "direction": "#main"}, ["scrollinto", "#main"]),
+            ({"action": "close"}, ["close"]),
+            ({"action": "get_html"}, ["get", "html", "body"]),
+            ({"action": "get_html", "selector": "#content"}, ["get", "html", "#content"]),
+        ],
+    )
+    async def test_action_maps_to_agent_browser_subcommand(self, params, expected_subcommand):
+        mock_container = MagicMock()
+        result_obj = MagicMock(exit_code=0, output=b"ok")
+        mock_container.exec_run.return_value = result_obj
+
+        client = self._make_client(mock_container)
+        await client.call_tool("browser_action", params)
+
+        call = mock_container.exec_run.call_args
+        argv = call.args[0]
+        # agent-browser is argv[0]; then global flags [--headed, --executable-path,
+        # /usr/bin/chromium]; then the subcommand. Pull the suffix.
+        # Find where the expected subcommand starts inside argv.
+        head = argv[0]
+        assert head == "agent-browser"
+        # The subcommand argv portion is argv[1:] minus global flags (always
+        # ['--headed', '--executable-path', '/usr/bin/chromium'] when headed not set).
+        # Default params in this parametrize set headed=false so --headed absent.
+        sub_argv = argv[1:]
+        # Remove the executable-path global flag pair we always inject.
+        assert "--executable-path" in sub_argv
+        assert "/usr/bin/chromium" in sub_argv
+        # Strip the (-executable-path, /usr/bin/chromium) pair to compare the rest.
+        rest = [a for a in sub_argv if a not in ("--executable-path", "/usr/bin/chromium")]
+        assert rest == expected_subcommand
+
+    @pytest.mark.asyncio
+    async def test_headed_mode_injects_headed_flag(self):
+        mock_container = MagicMock()
+        result_obj = MagicMock(exit_code=0, output=b"ok")
+        mock_container.exec_run.return_value = result_obj
+
+        client = self._make_client(mock_container)
+        await client.call_tool("browser_action", {"action": "launch", "headed": True})
+
+        argv = mock_container.exec_run.call_args.args[0]
+        assert "--headed" in argv
+
+    @pytest.mark.asyncio
+    async def test_screenshot_uses_image_screenshot_dir(self):
+        """Screenshots should default into the image's AGENT_BROWSER_SCREENSHOT_DIR."""
+        mock_container = MagicMock()
+        result_obj = MagicMock(exit_code=0, output=b"saved")
+        mock_container.exec_run.return_value = result_obj
+
+        client = self._make_client(mock_container)
+        await client.call_tool("browser_action", {"action": "screenshot"})
+
+        argv = mock_container.exec_run.call_args.args[0]
+        # `agent-browser screenshot <path>` - path must be under the
+        # /workspace/.agent-browser-screenshots dir the entrypoint pre-created.
+        screenshot_idx = argv.index("screenshot")
+        path = argv[screenshot_idx + 1]
+        assert path.startswith("/workspace/.agent-browser-screenshots/")
+        assert path.endswith(".png")
+
+    @pytest.mark.asyncio
+    async def test_execute_js_uses_eval(self):
+        mock_container = MagicMock()
+        result_obj = MagicMock(exit_code=0, output=b"undefined")
+        mock_container.exec_run.return_value = result_obj
+
+        client = self._make_client(mock_container)
+        await client.call_tool("browser_action", {"action": "execute_js", "script": "1+1"})
+
+        argv = mock_container.exec_run.call_args.args[0]
+        assert "eval" in argv
+        assert "1+1" in argv
+
+
+# --------------------------------------------------------------------------- #
+# Proxy tools -> CaidoClient (parametrized)
+# --------------------------------------------------------------------------- #
+
+
+class TestProxyToolRouting:
+    """list_requests / view_request route to CaidoClient; send_request /
+    repeat_request shell out to curl inside the sandbox."""
+
+    def _make_client(self, mock_container):
+        with patch("docker.from_env") as mock_from_env:
+            mock_client = MagicMock()
+            mock_client.containers.get.return_value = mock_container
+            mock_from_env.return_value = mock_client
+            client = SandboxExecClient("strix-cli-test")
+            client._container = mock_container
+            return client
+
+    @pytest.mark.asyncio
+    async def test_list_requests_delegates_to_caido(self):
+        client = self._make_client(MagicMock())
+        mock_caido = MagicMock()
+        mock_caido.list_requests = AsyncMock(
+            return_value={"requests": {"edges": [{"node": {"id": "r1"}}]}}
+        )
+        client._caido = mock_caido  # bypass bootstrap
+
+        result = await client.call_tool(
+            "list_requests",
+            {"host": "example.com", "method": "get", "limit": 5},
+        )
+
+        mock_caido.list_requests.assert_called_once()
+        kwargs = mock_caido.list_requests.call_args.kwargs
+        assert kwargs["host"] == "example.com"
+        assert kwargs["method"] == "get"
+        assert kwargs["limit"] == 5
+        assert "result" in result
+        assert "r1" in result["result"]["content"]
+
+    @pytest.mark.asyncio
+    async def test_view_request_delegates_to_caido(self):
+        client = self._make_client(MagicMock())
+        mock_caido = MagicMock()
+        mock_caido.view_request = AsyncMock(
+            return_value={"request": {"id": "r9", "host": "vuln.app", "raw": "GET / HTTP/1.1\r\n"}}
+        )
+        client._caido = mock_caido
+
+        result = await client.call_tool("view_request", {"request_id": "r9"})
+
+        mock_caido.view_request.assert_called_once_with("r9")
+        assert "r9" in result["result"]["content"]
+
+    @pytest.mark.asyncio
+    async def test_send_request_shells_out_to_curl_inside_container(self):
+        """Reproduce the design: send_request execs `curl` inside the sandbox
+        so the entrypoint's proxy.sh funnels traffic through Caido."""
+        mock_container = MagicMock()
+        result_obj = MagicMock(exit_code=0, output=b"HTTP/1.1 200 OK\r\n")
+        mock_container.exec_run.return_value = result_obj
+        client = self._make_client(mock_container)
+
+        result = await client.call_tool(
+            "send_request",
+            {"method": "post", "url": "https://api.example.com/login", "headers": {"X-Key": "v"}, "body": '{"u":"a"}'},
+        )
+
+        # Find the curl exec_run call (later calls are body-file write + rm).
+        curl_call = next(
+            (c for c in mock_container.exec_run.call_args_list
+             if c.args and c.args[0] and c.args[0][0] == "curl"),
+            None,
+        )
+        assert curl_call is not None, "curl was never exec'd"
+        argv = curl_call.args[0]
+        assert argv[0] == "curl"
+        assert "-X" in argv and "POST" in argv
+        assert "https://api.example.com/login" in argv
+        # Header should be forwarded as -H "X-Key: v".
+        idx = argv.index("-H")
+        assert "X-Key: v" in argv[idx + 1]
+        # Body written to a temp file via --data-binary @path.
+        assert "--data-binary" in argv
+        # Cleanup `rm -f <body_path>` should be issued afterwards.
+        rm_call = next(
+            (c for c in mock_container.exec_run.call_args_list
+             if c.args and c.args[0] and c.args[0][0] == "rm"),
+            None,
+        )
+        assert rm_call is not None, "temp body file was never cleaned up"
+        assert "result" in result
+
+    @pytest.mark.asyncio
+    async def test_repeat_request_loads_original_then_resends(self):
+        """repeat_request should fetch the original via Caido's view_request,
+        then re-send it via curl with the agent's modifications."""
+        mock_container = MagicMock()
+        result_obj = MagicMock(exit_code=0, output=b"HTTP/1.1 200 OK\r\n")
+        mock_container.exec_run.return_value = result_obj
+        client = self._make_client(mock_container)
+
+        mock_caido = MagicMock()
+        mock_caido.view_request = AsyncMock(
+            return_value={
+                "request": {
+                    "id": "r1",
+                    "host": "api.example.com",
+                    "port": 443,
+                    "method": "GET",
+                    "path": "/users",
+                    "isTls": True,
+                    "raw": "GET /users HTTP/1.1\r\nHost: api.example.com\r\nAccept: */*\r\n\r\n",
+                }
+            }
+        )
+        client._caido = mock_caido
+
+        result = await client.call_tool(
+            "repeat_request",
+            {"request_id": "r1", "modifications": {"headers": {"X-Fuzz": "1"}}},
+        )
+
+        mock_caido.view_request.assert_called_once_with("r1")
+        # The curl exec should target the reconstructed URL.
+        curl_call = next(
+            (c for c in mock_container.exec_run.call_args_list
+             if c.args and c.args[0] and c.args[0][0] == "curl"),
+            None,
+        )
+        assert curl_call is not None, "repeat_request never exec'd curl"
+        argv = curl_call.args[0]
+        assert "https://api.example.com/users" in argv
+        assert "X-Fuzz: 1" in argv
 
 
 class TestPentestTools:

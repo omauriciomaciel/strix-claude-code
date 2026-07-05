@@ -301,7 +301,7 @@ class TestSandboxStart:
                         sb = Sandbox(scan_id="test")
                         sb.start()
 
-                        mock_existing.stop.assert_called_once()
+                        mock_existing.kill.assert_called_once()  # v1.0.4: SIGKILL, not graceful stop
                         mock_existing.remove.assert_called_once_with(force=True)
 
     def test_copies_local_sources(self):
@@ -478,10 +478,14 @@ class TestCopyLocalSources:
 
 
 class TestSandboxStop:
-    """Tests for stop method."""
+    """Tests for stop method.
 
-    def test_stops_and_removes_container(self):
-        """Should stop and remove the container."""
+    Mirrors strix v1.0.4 (PR #548): the container is SIGKILL'd for an instant
+    quit instead of a graceful `stop(timeout=...)`.
+    """
+
+    def test_kills_and_removes_container(self):
+        """Should SIGKILL and remove the container (not graceful stop)."""
         with patch("docker.from_env") as mock_docker:
             mock_docker.return_value = MagicMock()
             sb = Sandbox()
@@ -491,7 +495,8 @@ class TestSandboxStop:
 
             sb.stop()
 
-            mock_container.stop.assert_called_once_with(timeout=10)
+            mock_container.kill.assert_called_once()
+            mock_container.stop.assert_not_called()
             mock_container.remove.assert_called_once_with(force=True)
             assert sb._container is None
 
@@ -505,13 +510,13 @@ class TestSandboxStop:
             # Should not raise
             sb.stop()
 
-    def test_handles_stop_error_gracefully(self):
-        """Should handle errors gracefully when stopping."""
+    def test_handles_kill_error_gracefully(self):
+        """Should handle errors gracefully when killing (e.g. already gone)."""
         with patch("docker.from_env") as mock_docker:
             mock_docker.return_value = MagicMock()
             sb = Sandbox()
             mock_container = MagicMock()
-            mock_container.stop.side_effect = Exception("Stop failed")
+            mock_container.kill.side_effect = Exception("Kill failed")
             sb._container = mock_container
 
             # Should not raise
