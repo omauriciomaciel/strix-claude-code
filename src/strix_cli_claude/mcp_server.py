@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 # Sandbox container info (set by main.py before starting MCP server)
 SANDBOX_CONTAINER = os.getenv("STRIX_SANDBOX_CONTAINER", "")
+# Caido GraphQL sidecar URL as reachable from the host (used by the
+# list_requests / view_request tools).
+CAIDO_URL = os.getenv("STRIX_CAIDO_URL", "")
 AGENT_ID = os.getenv("STRIX_AGENT_ID", "claude-cli-agent")
 REPORT_FILE = os.getenv("STRIX_REPORT_FILE", "")
 # Session context so EVERY session's findings land in the DB with enough
@@ -116,20 +119,29 @@ Actions: "execute" (run code), "new_session" (create session), "list_sessions", 
     ),
     Tool(
         name="browser_action",
-        description="""Control a Playwright browser for web testing.
+        description="""Drive a Chromium browser inside the sandbox via the `agent-browser` CLI.
+
+The strix-sandbox 1.0.0 image ships `agent-browser` (npm global) and a Debian
+`chromium` binary (Playwright was removed upstream). Browser traffic flows
+through the Caido proxy automatically because the entrypoint seeds
+HTTP_PROXY/HTTPS_PROXY via /etc/profile.d/proxy.sh.
 
 Actions:
-- launch: Start browser (headless)
-- goto: Navigate to URL
-- click: Click element by selector
-- type: Type text into element
-- scroll: Scroll page (up/down/to element)
-- screenshot: Take screenshot
-- execute_js: Run JavaScript
-- get_html: Get page HTML
-- close: Close browser
+- launch: Start browser (headless by default; pass `headed: true` for a visible
+  window - required when recording on a virtual display). Optional `url` opens it
+  immediately instead of about:blank.
+- goto: Navigate to URL (alias for launch + open)
+- click: Click element by CSS selector or @eN ref (use `agent-browser snapshot`
+  via terminal_execute to get refs first)
+- type: Type text into a selector
+- scroll: Scroll page (up/down/left/right) or to a CSS selector
+- screenshot: Take a screenshot (defaults to /workspace/.agent-browser-screenshots)
+- execute_js: Run JavaScript in the page
+- get_html: Get the page's HTML (or a selector's innerHTML)
+- close: Close the browser session
 
-The browser uses the Caido proxy automatically.""",
+Refs from `agent-browser snapshot` reuse across actions, so `click @e2` etc.
+just work after a snapshot. The browser uses the Caido proxy automatically.""",
         inputSchema={
             "type": "object",
             "properties": {
@@ -149,15 +161,19 @@ The browser uses the Caido proxy automatically.""",
     ),
     Tool(
         name="list_requests",
-        description="""List HTTP requests captured by the Caido proxy.
+        description="""List HTTP requests captured by Caido (read via the Caido GraphQL API).
+
+The strix-sandbox 1.0.0 image runs a Caido CLI sidecar; this tool hits its
+GraphQL endpoint on the host (via STRIX_CAIDO_URL) to list captured traffic.
 
 Filter by:
 - host: Filter by hostname
 - method: GET, POST, PUT, DELETE, etc.
-- path: URL path pattern
+- path: URL path pattern (substring match)
 - status_code: Response status
+- limit: Max results (default 50)
 
-Returns request/response summary for analysis.""",
+Returns JSON with edges + pageInfo (Caido Relay-style cursor pagination).""",
         inputSchema={
             "type": "object",
             "properties": {
@@ -171,9 +187,9 @@ Returns request/response summary for analysis.""",
     ),
     Tool(
         name="view_request",
-        description="""View detailed request/response from proxy history.
+        description="""View detailed request/response captured by Caido, including raw bytes.
 
-Returns full headers and body for both request and response.""",
+Returns full raw request + response from the Caido sidecar (host-side GraphQL).""",
         inputSchema={
             "type": "object",
             "properties": {
@@ -187,10 +203,13 @@ Returns full headers and body for both request and response.""",
     ),
     Tool(
         name="send_request",
-        description="""Send an HTTP request through the proxy.
+        description="""Send an ad-hoc HTTP request from inside the sandbox via curl.
 
-For manual testing and exploitation.
-Supports all HTTP methods and custom headers.""",
+The request automatically flows through Caido's proxy (the sandbox entrypoint
+seeds HTTP_PROXY env vars), so it's captured for later list_requests/view_request
+inspection - no replay session machinery needed.
+
+Supports all HTTP methods, custom headers, and a request body.""",
         inputSchema={
             "type": "object",
             "properties": {
@@ -206,7 +225,11 @@ Supports all HTTP methods and custom headers.""",
         name="repeat_request",
         description="""Modify and replay a captured request.
 
-Useful for testing parameter variations and payloads.""",
+Fetches the original via Caido's GraphQL endpoint (view_request), then re-sends
+it from inside the sandbox via curl with the agent's modifications, so the
+replay flows through the Caido proxy and gets captured too.
+
+modifications: {headers: {}, params: {}, body: string}""",
         inputSchema={
             "type": "object",
             "properties": {
@@ -897,7 +920,7 @@ def create_server() -> Server:
             if not SANDBOX_CONTAINER:
                 return [TextContent(type="text", text="Error: Sandbox container not configured — cannot download into sandbox.")]
             if tool_client is None:
-                tool_client = SandboxExecClient(SANDBOX_CONTAINER)
+                tool_client = SandboxExecClient(SANDBOX_CONTAINER, caido_url=CAIDO_URL or None)
             return await handle_download_extension(arguments, tool_client)
 
         if not SANDBOX_CONTAINER:
@@ -907,7 +930,7 @@ def create_server() -> Server:
             )]
 
         if tool_client is None:
-            tool_client = SandboxExecClient(SANDBOX_CONTAINER)
+            tool_client = SandboxExecClient(SANDBOX_CONTAINER, caido_url=CAIDO_URL or None)
 
         result = await tool_client.call_tool(name, arguments)
 

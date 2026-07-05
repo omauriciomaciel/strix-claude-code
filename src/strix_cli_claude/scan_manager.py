@@ -274,8 +274,10 @@ def stop_docker_container(scan_id: str) -> bool:
     )
 
     if result.stdout.strip():
-        # Container exists - stop and remove it
-        subprocess.run(["docker", "stop", container_name], capture_output=True)
+        # Container exists - SIGKILL it for an instant quit (mirrors strix
+        # v1.0.4 PR #548) then force-remove. `docker kill` is ~instant vs.
+        # `docker stop`'s 10s default grace period.
+        subprocess.run(["docker", "kill", container_name], capture_output=True)
         subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
         return True
 

@@ -226,8 +226,15 @@ SUBTLE BUT DEADLY:
 TOOLS AVAILABLE:
 - terminal_execute: Run shell commands (nmap, nuclei, sqlmap, ffuf, etc.)
 - python_action: Run Python scripts for custom exploits (action="execute", code="...")
-- browser_action: Control browser for web testing
-- list_requests / view_request / send_request / repeat_request: HTTP proxy control
+- browser_action: Drive the in-sandbox Chromium via the `agent-browser` CLI
+  (headless by default; `headed: true` for visible/recording). Use
+  `terminal_execute` to run `agent-browser snapshot` first to get @eN refs,
+  then `click @eN` / `fill @eN "..."` etc. Browser traffic flows through
+  Caido's proxy automatically (the entrypoint seeds HTTP_PROXY env vars).
+- list_requests / view_request: Inspect HTTP traffic captured by Caido via
+  the host-side GraphQL endpoint (no in-container HTTP bridge anymore).
+- send_request / repeat_request: Send or replay HTTP requests from inside the
+  sandbox via `curl` — they're auto-captured by Caido too.
 - str_replace_editor / list_files: View and edit files in /workspace
 - create_vulnerability_report: Document vulnerabilities with CVSS scoring (USE FOR ALL CONFIRMED VULNS). This now ALSO saves the finding to the findings DB and queues it for AUTOMATED VERIFICATION — always fill asset_type, source_ref, commit_ref, and repro (see AUTO-VERIFICATION below).
 - write_report: Add general findings/notes to the report
@@ -705,8 +712,15 @@ Do NOT modify the .claude/CLAUDE.md file unless explicitly instructed by the use
     return base_prompt
 
 
-def create_mcp_config(container_name: str, scan_id: str, output_file: str, extra_env: dict[str, str] | None = None) -> dict[str, Any]:
-    """Create MCP configuration for Claude CLI."""
+def create_mcp_config(container_name: str, scan_id: str, output_file: str, extra_env: dict[str, str] | None = None, caido_url: str | None = None) -> dict[str, Any]:
+    """Create MCP configuration for Claude CLI.
+
+    Args:
+        caido_url: base URL of the Caido GraphQL sidecar as reachable from the
+            host (e.g. ``http://127.0.0.1:<caido_port>``). The MCP server reads
+            ``STRIX_CAIDO_URL`` to drive the ``list_requests``/``view_request``
+            tools; without it the proxy tools error out at first use.
+    """
     # Get the path to the MCP server module
     mcp_server_path = Path(__file__).parent / "mcp_server.py"
 
@@ -715,6 +729,8 @@ def create_mcp_config(container_name: str, scan_id: str, output_file: str, extra
         "STRIX_AGENT_ID": f"claude-{scan_id}",
         "STRIX_REPORT_FILE": output_file,
     }
+    if caido_url:
+        env["STRIX_CAIDO_URL"] = caido_url
     if extra_env:
         env.update({k: v for k, v in extra_env.items() if v})
 
@@ -861,6 +877,7 @@ def _handle_org_scan(
             sandbox_info["scan_id"],
             output_file,
             extra_env={"STRIX_SCAN_KIND": "org", "STRIX_SESSION_LABEL": f"strix-{sandbox_info['scan_id']}"},
+            caido_url=f"http://127.0.0.1:{sandbox_info['caido_port']}",
         )
 
         temp_config_dir = tempfile.mkdtemp(prefix=f"strix-cli-{scan_id}")
@@ -1122,6 +1139,7 @@ def _handle_bounty_session(
             sandbox_info["scan_id"],
             output_file,
             extra_env={"STRIX_SCAN_KIND": "bounty", "STRIX_SESSION_LABEL": f"strix-{sandbox_info['scan_id']}"},
+            caido_url=f"http://127.0.0.1:{sandbox_info['caido_port']}",
         )
 
         temp_config_dir = tempfile.mkdtemp(prefix=f"strix-bounty-{scan_id}")
@@ -1622,6 +1640,7 @@ def main(
             sandbox_info["scan_id"],
             output_file,
             extra_env={"STRIX_SCAN_KIND": "single", "STRIX_SESSION_LABEL": f"strix-{sandbox_info['scan_id']}"},
+            caido_url=f"http://127.0.0.1:{sandbox_info['caido_port']}",
         )
 
         # Write MCP config to temp file

@@ -81,18 +81,24 @@ def _driver_steps(asset_type: str, source_ref: str, commit_ref: str | None) -> s
     commit = commit_ref or "(HEAD — record the exact SHA you land on)"
     rec = f"/workspace/{_REC_BASENAME}"
 
-    # Reusable: set up a headed browser + screen recording to MP4 video.
+# Reusable: set up a headed browser + screen recording to MP4 video.
+    # The strix-sandbox 1.0.0 image ships `agent-browser` (npm global) and a
+    # Debian `chromium` binary (Playwright was REMOVED upstream in 1.0.0).
     browser_setup = f"""   ENV SETUP (do this, install whatever is missing — server's time, not the user's):
      - apt-get update && apt-get install -y xvfb ffmpeg x11-utils >/dev/null
-     - install Playwright + Chromium:
-         (python) pip install playwright && playwright install --with-deps chromium
-         (or node) npm i -D playwright && npx playwright install --with-deps chromium
+       (chromium + agent-browser are already in the 1.0.0 image - do NOT reinstall)
      - start a virtual display:  Xvfb :99 -screen 0 1280x800x24 & ; export DISPLAY=:99
+     - headed browser via the agent-browser CLI:
+         agent-browser --headed --executable-path /usr/bin/chromium open about:blank
+       (refs from `agent-browser snapshot` reuse across actions; the Caido proxy
+        configured by the entrypoint is picked up via /etc/profile.d/proxy.sh)
      - start screen capture to VIDEO:
          ffmpeg -y -f x11grab -video_size 1280x800 -framerate 12 -i :99 \\
                 -pix_fmt yuv420p {rec}.mp4 &   # kill it after the PoC: pkill -INT ffmpeg
      PREFER recording real on-screen video to {rec}.mp4. If x11grab is impossible,
-     fall back to Playwright's built-in record_video_dir, then move the file to {rec}.webm."""
+     fall back to frame grab: `agent-browser screenshot` in a loop into
+     /workspace/.agent-browser-screenshots/ then `ffmpeg -framerate 2 -pattern_type
+     glob -i '/workspace/.agent-browser-screenshots/shot-*.png' {rec}.mp4`."""
 
     if at == "CHROME_EXTENSION":
         return f"""ASSET TYPE: Chrome extension — must be shown in a REAL browser, on VIDEO.
@@ -100,12 +106,15 @@ def _driver_steps(asset_type: str, source_ref: str, commit_ref: str | None) -> s
    `git diff` MUST be empty; for a published .crx, note exact version+hash. Do NOT edit it.
 {browser_setup}
 2. Launch a HEADED Chromium with the extension loaded (headless cannot load MV3 UI):
-     chromium.launchPersistentContext(userDataDir, headless=False, args=[
-       f"--disable-extensions-except={{ext_dir}}", f"--load-extension={{ext_dir}}"])
-3. Build the EXACT attack page from the repro (e.g. the clickjacking iframe), open it,
-   and perform the hijacked action SLOWLY and visibly so the video clearly shows:
+     agent-browser --headed --executable-path /usr/bin/chromium \\
+                    --extension "{{ext_dir}}" open about:blank
+   (agent-browser's `--extension` is repeatable and loads the unpacked MV3 UI;
+    the Caido CA already trusted by the image's entrypoint lets it intercept traffic.)
+3. Build the EXACT attack page from the repro (e.g. the clickjacking iframe), open it
+   via `agent-browser open <url>`, and perform the hijacked action SLOWLY and visibly
+   (`agent-browser click @eN` / `agent-browser fill @eN "<text>"`) so the video shows:
    the extension UI, the overlay/iframe, and the unintended action firing.
-4. Stop ffmpeg. The MP4 at {rec}.mp4 must clearly show the attack working."""
+4. Stop ffmpeg (`pkill -INT ffmpeg`). The MP4 at {rec}.mp4 must clearly show the attack working."""
 
     if at == "VSCODE_EXTENSION":
         return f"""ASSET TYPE: VS Code extension — shown in a REAL VS Code window, on VIDEO.
@@ -384,7 +393,9 @@ def _run_verification(finding_id: int) -> None:
         report_file = str(RECORDINGS_DIR / f"finding_{finding_id}_verify.md")
         mcp_config = create_mcp_config(
             info["container_name"], info["scan_id"],
-            report_file, extra_env={"STRIX_SCAN_KIND": "verify"},
+            report_file,
+            extra_env={"STRIX_SCAN_KIND": "verify"},
+            caido_url=f"http://127.0.0.1:{info['caido_port']}",
         )
         temp_dir = tempfile.mkdtemp(prefix=f"strix-verify-{finding_id}-")
         cfg_path = Path(temp_dir) / "mcp.json"

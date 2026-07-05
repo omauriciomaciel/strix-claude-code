@@ -29,8 +29,12 @@ def get_cpu_count(reserve: int = 2) -> int:
 DEFAULT_SANDBOX_IMAGE = "ghcr.io/usestrix/strix-sandbox:1.0.0"
 HOST_GATEWAY_HOSTNAME = "host.docker.internal"
 DOCKER_TIMEOUT = 60
-# Caido always binds to this port *inside* the container (hardcoded in the
-# image's docker-entrypoint.sh since 1.0.0 - no longer configurable via env).
+# Caido always binds to this fixed port *inside* the container. Upstream's
+# containers/docker-entrypoint.sh has hardcoded `CAIDO_PORT=48080` since the
+# earliest inspectable tags (v0.7.0/v0.8.3) - it was never host-configurable.
+# What changed in strix-sandbox 1.0.0 is the *removal* of the in-container
+# HTTP tool server (strix/runtime/tool_server.py) that the host used to talk
+# to; the host now drives Caido via its GraphQL API on this port instead.
 CAIDO_CONTAINER_PORT = 48080
 CONTAINER_HEALTH_RETRIES = 30
 CONTAINER_HEALTH_REQUEST_TIMEOUT = 5
@@ -115,8 +119,10 @@ class Sandbox:
         try:
             existing = self.client.containers.get(container_name)
             logger.info(f"Removing existing container {container_name}")
+            # v1.0.4 upstream SIGKILLs the container for an instant quit
+            # (PR #548) instead of a graceful `stop(timeout=...)`.
             with contextlib.suppress(Exception):
-                existing.stop(timeout=5)
+                existing.kill()
             existing.remove(force=True)
             time.sleep(1)
         except NotFound:
@@ -339,14 +345,20 @@ class Sandbox:
         )
 
     def stop(self) -> None:
-        """Stop and remove the sandbox container."""
+        """Stop and remove the sandbox container.
+
+        Mirrors strix v1.0.4 (PR #548): SIGKILL the container for an instant
+        quit instead of a graceful `stop(timeout=...)`. The container is
+        disposable and any in-flight work (e.g. a recording ffmpeg) is already
+        toast by the time the user quits.
+        """
         if self._container:
-            logger.info(f"Stopping container {self._container.name}")
+            logger.info(f"Killing container {self._container.name}")
             try:
-                self._container.stop(timeout=10)
+                self._container.kill()
                 self._container.remove(force=True)
             except Exception as e:
-                logger.warning(f"Error stopping container: {e}")
+                logger.warning(f"Error killing container: {e}")
             self._container = None
 
     def exec_command(self, command: str, user: str = "pentester") -> tuple[int, str]:
