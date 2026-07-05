@@ -7,7 +7,6 @@ import os
 import sys
 from typing import Any
 
-import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
@@ -19,12 +18,12 @@ from strix_cli_claude import db as _h1_db
 from strix_cli_claude.h1_client import H1Client, H1Error
 from strix_cli_claude.intigriti_client import IntigritiClient, IntigritiError
 from strix_cli_claude.bugcrowd_client import BugcrowdClient, BugcrowdError
+from strix_cli_claude.sandbox_client import SandboxExecClient
 
 logger = logging.getLogger(__name__)
 
-# Tool server connection info (set by main.py before starting MCP server)
-TOOL_SERVER_URL = os.getenv("STRIX_TOOL_SERVER_URL", "")
-TOOL_SERVER_TOKEN = os.getenv("STRIX_TOOL_SERVER_TOKEN", "")
+# Sandbox container info (set by main.py before starting MCP server)
+SANDBOX_CONTAINER = os.getenv("STRIX_SANDBOX_CONTAINER", "")
 AGENT_ID = os.getenv("STRIX_AGENT_ID", "claude-cli-agent")
 REPORT_FILE = os.getenv("STRIX_REPORT_FILE", "")
 # Session context so EVERY session's findings land in the DB with enough
@@ -34,81 +33,6 @@ SCAN_KIND = os.getenv("STRIX_SCAN_KIND", "")            # org | single | bounty 
 DEFAULT_ASSET_TYPE = os.getenv("STRIX_ASSET_TYPE", "")  # SOURCE_CODE | CHROME_EXTENSION | ...
 DEFAULT_SOURCE_REF = os.getenv("STRIX_SOURCE_REF", "")  # repo URL / extension id / target URL
 
-
-class ToolServerClient:
-    """Client to communicate with the sandbox tool server."""
-
-    MAX_RETRIES = 3
-    RETRY_DELAY = 2.0  # seconds
-
-    def __init__(self, base_url: str, token: str, agent_id: str):
-        self.base_url = base_url
-        self.token = token
-        self.agent_id = agent_id
-        self.client = httpx.AsyncClient(
-            base_url=base_url,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=300.0,
-        )
-
-    async def call_tool(self, tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Call a tool on the sandbox tool server with retry logic."""
-        last_error = None
-
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                response = await self.client.post(
-                    "/execute",
-                    json={
-                        "tool_name": tool_name,
-                        "kwargs": params,
-                        "agent_id": self.agent_id,
-                    },
-                )
-                response.raise_for_status()
-                result = response.json()
-
-                # Validate response structure
-                if not isinstance(result, dict):
-                    last_error = f"Invalid response from tool server: expected dict, got {type(result).__name__}"
-                    continue
-
-                # Check for empty error response (tool server bug)
-                if "error" in result and "result" not in result:
-                    error_msg = result.get("error", "")
-                    if not error_msg:
-                        last_error = "Tool server returned empty error (no result)"
-                        if attempt < self.MAX_RETRIES - 1:
-                            await asyncio.sleep(self.RETRY_DELAY)
-                        continue
-
-                return result
-
-            except httpx.ConnectError as e:
-                last_error = f"Cannot connect to tool server at {self.base_url}. Is the Docker container running? Details: {e}"
-            except httpx.TimeoutException as e:
-                last_error = f"Tool server request timed out. The command may still be running. Details: {e}"
-            except httpx.HTTPStatusError as e:
-                last_error = f"HTTP error {e.response.status_code}: {e.response.text[:500] if e.response.text else 'No response body'}"
-            except Exception as e:
-                last_error = f"Tool server error ({type(e).__name__}): {str(e) or 'Unknown error'}"
-
-            # Wait before retry (except on last attempt)
-            if attempt < self.MAX_RETRIES - 1:
-                await asyncio.sleep(self.RETRY_DELAY)
-
-        # All retries failed
-        return {
-            "error": f"TOOL FAILURE after {self.MAX_RETRIES} attempts: {last_error}\n\n"
-                     f"The sandbox tools are not responding. Please check:\n"
-                     f"1. Is the Docker container still running? (docker ps)\n"
-                     f"2. Check container logs: docker logs <container_name>\n"
-                     f"3. The tool server may need to be restarted\n\n"
-                     f"IMPORTANT: Please inform the user about this issue and wait for guidance before continuing."
-        }
-
-    async def close(self):
-        await self.client.aclose()
 
 
 # Define the tools available for pen testing
@@ -930,7 +854,7 @@ def create_server() -> Server:
     except Exception as e:
         logger.warning("DB init failed (H1 tools will error individually): %s", e)
 
-    tool_client: ToolServerClient | None = None
+    tool_client: SandboxExecClient | None = None
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
@@ -970,20 +894,20 @@ def create_server() -> Server:
             return await handle_fetch_github_org_repos(arguments)
 
         if name == "download_extension":
-            if not TOOL_SERVER_URL or not TOOL_SERVER_TOKEN:
-                return [TextContent(type="text", text="Error: Tool server not configured — cannot download into sandbox.")]
+            if not SANDBOX_CONTAINER:
+                return [TextContent(type="text", text="Error: Sandbox container not configured — cannot download into sandbox.")]
             if tool_client is None:
-                tool_client = ToolServerClient(TOOL_SERVER_URL, TOOL_SERVER_TOKEN, AGENT_ID)
+                tool_client = SandboxExecClient(SANDBOX_CONTAINER)
             return await handle_download_extension(arguments, tool_client)
 
-        if not TOOL_SERVER_URL or not TOOL_SERVER_TOKEN:
+        if not SANDBOX_CONTAINER:
             return [TextContent(
                 type="text",
-                text="Error: Tool server not configured. Make sure STRIX_TOOL_SERVER_URL and STRIX_TOOL_SERVER_TOKEN are set.",
+                text="Error: Sandbox container not configured. Make sure STRIX_SANDBOX_CONTAINER is set.",
             )]
 
         if tool_client is None:
-            tool_client = ToolServerClient(TOOL_SERVER_URL, TOOL_SERVER_TOKEN, AGENT_ID)
+            tool_client = SandboxExecClient(SANDBOX_CONTAINER)
 
         result = await tool_client.call_tool(name, arguments)
 
@@ -1438,7 +1362,7 @@ def create_server() -> Server:
 
         return [TextContent(type="text", text=output)]
 
-    async def handle_download_extension(arguments: dict[str, Any], client: ToolServerClient) -> list[TextContent]:
+    async def handle_download_extension(arguments: dict[str, Any], client: SandboxExecClient) -> list[TextContent]:
         """Resolve a marketplace URL to a direct package URL, then run curl+unzip
         inside the sandbox to extract the extension to /workspace/<name>.
         """

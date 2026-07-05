@@ -409,15 +409,15 @@ The advisor will read your report and return exactly what you should do next.
 ALWAYS follow the advisor's guidance - it has fresh context and can see gaps you might miss.
 
 PARALLEL SUBAGENTS (for additional coverage):
-Subagents can call sandbox tools using the helper script at /tmp/strix-tool:
+Subagents can run commands in the sandbox using the helper script at /tmp/strix-tool:
 
-Usage: /tmp/strix-tool <tool_name> '<json_args>'
+Usage: /tmp/strix-tool <shell command>
 
 Example - subagent runs nmap:
-  /tmp/strix-tool terminal_execute '{{"command": "nmap -p- target.com"}}'
+  /tmp/strix-tool nmap -p- target.com
 
 Example - subagent runs sqlmap:
-  /tmp/strix-tool terminal_execute '{{"command": "sqlmap -u http://target/login --forms --batch"}}'
+  /tmp/strix-tool sqlmap -u http://target/login --forms --batch
 
 WHEN TO USE PARALLEL AGENTS:
 - Spawn separate agents for each vulnerability class (SQLi, XSS, SSRF, etc.)
@@ -705,14 +705,13 @@ Do NOT modify the .claude/CLAUDE.md file unless explicitly instructed by the use
     return base_prompt
 
 
-def create_mcp_config(tool_server_url: str, token: str, scan_id: str, output_file: str, extra_env: dict[str, str] | None = None) -> dict[str, Any]:
+def create_mcp_config(container_name: str, scan_id: str, output_file: str, extra_env: dict[str, str] | None = None) -> dict[str, Any]:
     """Create MCP configuration for Claude CLI."""
     # Get the path to the MCP server module
     mcp_server_path = Path(__file__).parent / "mcp_server.py"
 
     env = {
-        "STRIX_TOOL_SERVER_URL": tool_server_url,
-        "STRIX_TOOL_SERVER_TOKEN": token,
+        "STRIX_SANDBOX_CONTAINER": container_name,
         "STRIX_AGENT_ID": f"claude-{scan_id}",
         "STRIX_REPORT_FILE": output_file,
     }
@@ -854,13 +853,11 @@ def _handle_org_scan(
 
         console.print(f"[green]Sandbox ready![/green]")
         console.print(f"  Container: {sandbox_info['container_name']}")
-        console.print(f"  Tool server: {sandbox_info['tool_server_url']}")
         console.print(f"  CPUs allocated: {sandbox_info['cpu_count']}")
 
         # Create MCP config
         mcp_config = create_mcp_config(
-            sandbox_info["tool_server_url"],
-            sandbox_info["tool_server_token"],
+            sandbox_info["container_name"],
             sandbox_info["scan_id"],
             output_file,
             extra_env={"STRIX_SCAN_KIND": "org", "STRIX_SESSION_LABEL": f"strix-{sandbox_info['scan_id']}"},
@@ -870,23 +867,10 @@ def _handle_org_scan(
         mcp_config_path = Path(temp_config_dir) / "mcp.json"
         mcp_config_path.write_text(json.dumps(mcp_config, indent=2))
 
-        # Write tool server credentials for parallel subagents
-        creds_file = Path("/tmp/strix-tool-server.env")
-        creds_file.write_text(f"""STRIX_TOOL_URL={sandbox_info["tool_server_url"]}
-STRIX_TOOL_TOKEN={sandbox_info["tool_server_token"]}
-""")
-        creds_file.chmod(0o600)
-
-        # Create helper script for subagents
+        # Create helper script for subagents (runs commands in the sandbox via docker exec)
         helper_script = Path("/tmp/strix-tool")
         helper_script.write_text(f'''#!/bin/bash
-TOOL_NAME="$1"
-TOOL_ARGS="$2"
-curl -s -X POST "{sandbox_info["tool_server_url"]}/execute" \\
-  -H "Authorization: Bearer {sandbox_info["tool_server_token"]}" \\
-  -H "Content-Type: application/json" \\
-  -d "{{\\"tool_name\\": \\"$TOOL_NAME\\", \\"kwargs\\": $TOOL_ARGS, \\"agent_id\\": \\"subagent\\"}}" \\
-  | jq -r '.result.content // .result // .error // "No output"'
+docker exec -u pentester -w /workspace {sandbox_info["container_name"]} bash -lc "$*"
 ''')
         helper_script.chmod(0o755)
 
@@ -1131,12 +1115,10 @@ def _handle_bounty_session(
 
         console.print(f"[green]Sandbox ready![/green]")
         console.print(f"  Container: {sandbox_info['container_name']}")
-        console.print(f"  Tool server: {sandbox_info['tool_server_url']}")
         console.print(f"  CPUs allocated: {sandbox_info['cpu_count']}")
 
         mcp_config = create_mcp_config(
-            sandbox_info["tool_server_url"],
-            sandbox_info["tool_server_token"],
+            sandbox_info["container_name"],
             sandbox_info["scan_id"],
             output_file,
             extra_env={"STRIX_SCAN_KIND": "bounty", "STRIX_SESSION_LABEL": f"strix-{sandbox_info['scan_id']}"},
@@ -1632,13 +1614,11 @@ def main(
 
         console.print(f"[green]Sandbox ready![/green]")
         console.print(f"  Container: {sandbox_info['container_name']}")
-        console.print(f"  Tool server: {sandbox_info['tool_server_url']}")
         console.print(f"  CPUs allocated: {sandbox_info['cpu_count']}")
 
         # Create temporary MCP config
         mcp_config = create_mcp_config(
-            sandbox_info["tool_server_url"],
-            sandbox_info["tool_server_token"],
+            sandbox_info["container_name"],
             sandbox_info["scan_id"],
             output_file,
             extra_env={"STRIX_SCAN_KIND": "single", "STRIX_SESSION_LABEL": f"strix-{sandbox_info['scan_id']}"},
@@ -1649,29 +1629,14 @@ def main(
         mcp_config_path = Path(temp_config_dir) / "mcp.json"
         mcp_config_path.write_text(json.dumps(mcp_config, indent=2))
 
-        # Write tool server credentials for parallel subagents
-        # This allows subagents to call the tool server directly via curl
-        creds_file = Path("/tmp/strix-tool-server.env")
-        creds_file.write_text(f"""STRIX_TOOL_URL={sandbox_info["tool_server_url"]}
-STRIX_TOOL_TOKEN={sandbox_info["tool_server_token"]}
-""")
-        creds_file.chmod(0o600)
-
-        # Create helper script for subagents to call tools
+        # Create helper script for subagents to run commands in the sandbox via docker exec
         helper_script = Path("/tmp/strix-tool")
         helper_script.write_text(f'''#!/bin/bash
-# Helper script for parallel subagents to call Strix tools
-# Usage: strix-tool <tool_name> '<json_args>'
-# Example: strix-tool terminal_execute '{{"command": "nmap -p- target.com"}}'
+# Helper script for parallel subagents to run shell commands in the sandbox
+# Usage: strix-tool <shell command>
+# Example: strix-tool nmap -p- target.com
 
-TOOL_NAME="$1"
-TOOL_ARGS="$2"
-
-curl -s -X POST "{sandbox_info["tool_server_url"]}/execute" \\
-  -H "Authorization: Bearer {sandbox_info["tool_server_token"]}" \\
-  -H "Content-Type: application/json" \\
-  -d "{{\\"tool_name\\": \\"$TOOL_NAME\\", \\"kwargs\\": $TOOL_ARGS, \\"agent_id\\": \\"subagent\\"}}" \\
-  | jq -r '.result.content // .result // .error // "No output"'
+docker exec -u pentester -w /workspace {sandbox_info["container_name"]} bash -lc "$*"
 ''')
         helper_script.chmod(0o755)
 

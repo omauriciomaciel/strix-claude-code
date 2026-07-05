@@ -26,11 +26,14 @@ def get_cpu_count(reserve: int = 2) -> int:
     return available
 
 # Default strix sandbox image
-DEFAULT_SANDBOX_IMAGE = "ghcr.io/usestrix/strix-sandbox:0.1.11"
+DEFAULT_SANDBOX_IMAGE = "ghcr.io/usestrix/strix-sandbox:1.0.0"
 HOST_GATEWAY_HOSTNAME = "host.docker.internal"
 DOCKER_TIMEOUT = 60
-TOOL_SERVER_HEALTH_RETRIES = 10
-TOOL_SERVER_HEALTH_REQUEST_TIMEOUT = 5
+# Caido always binds to this port *inside* the container (hardcoded in the
+# image's docker-entrypoint.sh since 1.0.0 - no longer configurable via env).
+CAIDO_CONTAINER_PORT = 48080
+CONTAINER_HEALTH_RETRIES = 30
+CONTAINER_HEALTH_REQUEST_TIMEOUT = 5
 
 
 class SandboxError(Exception):
@@ -59,8 +62,6 @@ class Sandbox:
             ) from e
 
         self._container: Container | None = None
-        self._tool_server_port: int | None = None
-        self._tool_server_token: str | None = None
         self._caido_port: int | None = None
 
     def _find_available_port(self, exclude: set[int] | None = None) -> int:
@@ -73,9 +74,6 @@ class Sandbox:
                 if port not in exclude:
                     return port
         raise SandboxError("Could not find available port")
-
-    def _generate_token(self) -> str:
-        return secrets.token_urlsafe(32)
 
     def _exec_with_timeout(
         self, container: Container, cmd: str, timeout: int = DOCKER_TIMEOUT, **kwargs: Any
@@ -124,10 +122,7 @@ class Sandbox:
         except NotFound:
             pass
 
-        # Find available ports (ensure they're different from each other)
         self._caido_port = self._find_available_port()
-        self._tool_server_port = self._find_available_port(exclude={self._caido_port})
-        self._tool_server_token = self._generate_token()
 
         # Get CPU count for parallel operations
         cpu_count = get_cpu_count()
@@ -136,7 +131,6 @@ class Sandbox:
         logger.info(f"Starting container {container_name}")
         logger.info(f"  CPUs available: {cpu_count}")
         logger.info(f"  Caido proxy port: {self._caido_port}")
-        logger.info(f"  Tool server port: {self._tool_server_port}")
         logger.info(f"  Docker socket mounted: {self.mount_docker_socket}")
 
         # Build volumes list
@@ -151,18 +145,18 @@ class Sandbox:
             else:
                 logger.warning("Docker socket not found at /var/run/docker.sock")
 
-        # Create and start container with all available CPUs
+        # Create and start container with all available CPUs.
+        # No entrypoint override: the image's own docker-entrypoint.sh brings up
+        # Caido, trusts the CA and configures the proxy before `exec "$@"`
+        # hands off to our keep-alive command (same pattern strix's own
+        # StrixDockerSandboxClient uses upstream).
         self._container = self.client.containers.run(
             self.image,
-            command="sleep infinity",
-            entrypoint="",  # Override image entrypoint to prevent auto-initialization
+            command=["tail", "-f", "/dev/null"],
             detach=True,
             name=container_name,
             hostname=container_name,
-            ports={
-                f"{self._caido_port}/tcp": self._caido_port,
-                f"{self._tool_server_port}/tcp": self._tool_server_port,
-            },
+            ports={f"{CAIDO_CONTAINER_PORT}/tcp": self._caido_port},
             cap_add=["NET_ADMIN", "NET_RAW"],
             labels={"strix-cli-scan-id": self.scan_id},
             # Allocate all CPUs to the container
@@ -170,9 +164,6 @@ class Sandbox:
             volumes=volumes if volumes else None,
             environment={
                 "PYTHONUNBUFFERED": "1",
-                "CAIDO_PORT": str(self._caido_port),
-                "TOOL_SERVER_PORT": str(self._tool_server_port),
-                "TOOL_SERVER_TOKEN": self._tool_server_token,
                 "HOST_GATEWAY": HOST_GATEWAY_HOSTNAME,
                 # Pass CPU count for tools to use
                 "STRIX_CPU_COUNT": str(cpu_count),
@@ -186,8 +177,8 @@ class Sandbox:
             tty=True,
         )
 
-        # Initialize container (start Caido proxy and tool server)
-        self._initialize_container()
+        # Wait for the entrypoint's Caido/CA/proxy setup to finish
+        self._wait_for_ready()
 
         # Setup Docker access if socket is mounted
         if self.mount_docker_socket:
@@ -197,78 +188,49 @@ class Sandbox:
         if local_sources:
             self._copy_local_sources(local_sources)
 
-        host = self._resolve_docker_host()
-
         return {
             "container_id": self._container.id,
             "container_name": container_name,
-            "tool_server_url": f"http://{host}:{self._tool_server_port}",
-            "tool_server_token": self._tool_server_token,
             "caido_port": self._caido_port,
             "scan_id": self.scan_id,
             "cpu_count": cpu_count,
         }
 
-    def _initialize_container(self) -> None:
-        """Initialize Caido and tool server inside container."""
-        if not self._container:
-            raise SandboxError("Container not started")
+    def _wait_for_ready(self) -> None:
+        """Wait for the entrypoint to finish bringing up Caido + the proxy config.
 
-        logger.info("Initializing Caido proxy...")
-        self._exec_with_timeout(
-            self._container,
-            f"bash -c 'export CAIDO_PORT={self._caido_port} && /usr/local/bin/docker-entrypoint.sh true'",
-            detach=False,
-        )
-
-        time.sleep(5)
-
-        # Get Caido token
-        result = self._exec_with_timeout(
-            self._container,
-            "bash -c 'source /etc/profile.d/proxy.sh && echo $CAIDO_API_TOKEN'",
-            user="pentester",
-        )
-        caido_token = result.output.decode().strip() if result.exit_code == 0 else ""
-
-        logger.info("Starting tool server...")
-        self._container.exec_run(
-            f"bash -c 'source /etc/profile.d/proxy.sh && cd /app && "
-            f"STRIX_SANDBOX_MODE=true CAIDO_API_TOKEN={caido_token} CAIDO_PORT={self._caido_port} "
-            f"poetry run python strix/runtime/tool_server.py --token {self._tool_server_token} "
-            f"--host 0.0.0.0 --port {self._tool_server_port} &'",
-            detach=True,
-            user="pentester",
-        )
-
-        time.sleep(2)
-
-        # Wait for health
-        host = self._resolve_docker_host()
-        health_url = f"http://{host}:{self._tool_server_port}/health"
-        self._wait_for_health(health_url)
-
-    def _wait_for_health(self, health_url: str) -> None:
-        """Wait for tool server to be healthy."""
+        The entrypoint script runs synchronously before `exec "$@"` starts our
+        `tail -f /dev/null` keep-alive, so polling Caido's GraphQL endpoint from
+        the host doubles as a readiness probe for the whole entrypoint.
+        """
         import httpx
 
-        logger.info(f"Waiting for tool server at {health_url}")
+        host = self._resolve_docker_host()
+        graphql_url = f"http://{host}:{self._caido_port}/graphql/"
+        logger.info(f"Waiting for Caido at {graphql_url}")
 
-        for attempt in range(TOOL_SERVER_HEALTH_RETRIES):
+        for attempt in range(CONTAINER_HEALTH_RETRIES):
             try:
-                with httpx.Client(trust_env=False, timeout=TOOL_SERVER_HEALTH_REQUEST_TIMEOUT) as client:
-                    response = client.get(health_url)
-                    response.raise_for_status()
-                    health = response.json()
-                    if health.get("status") == "healthy":
-                        logger.info(f"Tool server healthy after {attempt + 1} attempts")
-                        return
+                with httpx.Client(trust_env=False, timeout=CONTAINER_HEALTH_REQUEST_TIMEOUT) as client:
+                    response = client.get(graphql_url)
+                    if response.status_code in (200, 400):
+                        break
             except Exception as e:
-                logger.debug(f"Health check attempt {attempt + 1}: {e}")
+                logger.debug(f"Caido health check attempt {attempt + 1}: {e}")
+            time.sleep(min(2**attempt * 0.5, 5))
+        else:
+            raise SandboxError("Caido proxy failed to start in the sandbox container")
 
-            time.sleep(min(2 ** attempt * 0.5, 5))
-
-        raise SandboxError("Tool server failed to start")
+        # Entrypoint writes proxy.sh right after Caido comes up; give it a
+        # moment to land so exec'd shells (which source it via profile.d) see it.
+        for _ in range(CONTAINER_HEALTH_RETRIES):
+            result = self._exec_with_timeout(
+                self._container, "test -f /etc/profile.d/proxy.sh", user="root",
+            )
+            if result.exit_code == 0:
+                return
+            time.sleep(0.5)
+        raise SandboxError("Sandbox container did not finish entrypoint setup in time")
 
     def _setup_docker_access(self) -> None:
         """Setup Docker CLI and socket permissions for container scanning."""

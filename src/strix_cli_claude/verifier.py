@@ -383,7 +383,7 @@ def _run_verification(finding_id: int) -> None:
 
         report_file = str(RECORDINGS_DIR / f"finding_{finding_id}_verify.md")
         mcp_config = create_mcp_config(
-            info["tool_server_url"], info["tool_server_token"], info["scan_id"],
+            info["container_name"], info["scan_id"],
             report_file, extra_env={"STRIX_SCAN_KIND": "verify"},
         )
         temp_dir = tempfile.mkdtemp(prefix=f"strix-verify-{finding_id}-")
