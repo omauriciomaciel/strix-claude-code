@@ -15,11 +15,12 @@ Strix Claude Code provides:
 ## Prerequisites
 
 1. **Docker**: Install and run Docker Desktop
-2. **Claude CLI**: Install and authenticate
+2. **Claude Code CLI**: Install and authenticate
    ```bash
-   npm install -g @anthropic-ai/claude-cli
+   npm install -g @anthropic-ai/claude-code
    claude login
    ```
+   Tested with Claude Code `2.x`. Check with `claude --version`.
 3. **Python 3.11+**: Required for the wrapper
 4. **screen**: Required for TUI (usually pre-installed on Linux/macOS)
    ```bash
