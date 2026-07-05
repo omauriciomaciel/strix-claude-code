@@ -156,7 +156,7 @@ class TestBrowserActionRouting:
     @pytest.mark.parametrize(
         "params, expected_subcommand",
         [
-            ({"action": "launch"}, ["open"]),
+            ({"action": "launch"}, ["open", "about:blank"]),
             ({"action": "launch", "url": "https://x.com"}, ["open", "https://x.com"]),
             ({"action": "goto", "url": "https://y.com"}, ["open", "https://y.com"]),
             ({"action": "click", "selector": "#btn"}, ["click", "#btn"]),
@@ -301,28 +301,31 @@ class TestProxyToolRouting:
         result_obj = MagicMock(exit_code=0, output=b"HTTP/1.1 200 OK\r\n")
         mock_container.exec_run.return_value = result_obj
         client = self._make_client(mock_container)
+        # send_request bootstraps Caido before proxying; stub it out.
+        client._caido = MagicMock()
 
         result = await client.call_tool(
             "send_request",
             {"method": "post", "url": "https://api.example.com/login", "headers": {"X-Key": "v"}, "body": '{"u":"a"}'},
         )
 
-        # Find the curl exec_run call (later calls are body-file write + rm).
+        # curl is exec'd via `bash -lc "<curl ...>"` so /etc/profile.d/proxy.sh
+        # (which exports the Caido proxy env vars) gets sourced.
         curl_call = next(
             (c for c in mock_container.exec_run.call_args_list
-             if c.args and c.args[0] and c.args[0][0] == "curl"),
+             if c.args and c.args[0] and c.args[0][:2] == ["bash", "-lc"] and "curl" in c.args[0][2]),
             None,
         )
         assert curl_call is not None, "curl was never exec'd"
         argv = curl_call.args[0]
-        assert argv[0] == "curl"
-        assert "-X" in argv and "POST" in argv
-        assert "https://api.example.com/login" in argv
+        command = argv[2]
+        assert command.startswith("curl")
+        assert "-X POST" in command
+        assert "https://api.example.com/login" in command
         # Header should be forwarded as -H "X-Key: v".
-        idx = argv.index("-H")
-        assert "X-Key: v" in argv[idx + 1]
+        assert "X-Key: v" in command
         # Body written to a temp file via --data-binary @path.
-        assert "--data-binary" in argv
+        assert "--data-binary" in command
         # Cleanup `rm -f <body_path>` should be issued afterwards.
         rm_call = next(
             (c for c in mock_container.exec_run.call_args_list
@@ -366,13 +369,13 @@ class TestProxyToolRouting:
         # The curl exec should target the reconstructed URL.
         curl_call = next(
             (c for c in mock_container.exec_run.call_args_list
-             if c.args and c.args[0] and c.args[0][0] == "curl"),
+             if c.args and c.args[0] and c.args[0][:2] == ["bash", "-lc"] and "curl" in c.args[0][2]),
             None,
         )
         assert curl_call is not None, "repeat_request never exec'd curl"
-        argv = curl_call.args[0]
-        assert "https://api.example.com/users" in argv
-        assert "X-Fuzz: 1" in argv
+        command = curl_call.args[0][2]
+        assert "https://api.example.com/users" in command
+        assert "X-Fuzz: 1" in command
 
 
 class TestPentestTools:

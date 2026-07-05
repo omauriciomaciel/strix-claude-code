@@ -28,28 +28,26 @@ class TestBuildHttpqlFilter:
 
     def test_single_clause_returns_clause_directly(self):
         result = _build_httpql_filter(host="example.com")
-        assert result == {"host": {"eq": "example.com"}}
+        assert result == {"code": 'req.host.cont:"example.com"'}
 
     def test_multiple_clauses_anded(self):
         result = _build_httpql_filter(
             host="example.com", method="get", path="/api", status_code=200
         )
         assert result == {
-            "and": [
-                {"host": {"eq": "example.com"}},
-                {"method": {"eq": "GET"}},
-                {"path": {"contains": "/api"}},
-                {"resp.status": {"eq": 200}},
-            ]
+            "code": (
+                'req.host.cont:"example.com" and req.method.eq:"GET" and '
+                'req.path.cont:"/api" and resp.code.eq:200'
+            )
         }
 
     def test_method_uppercased(self):
         result = _build_httpql_filter(method="post")
-        assert result == {"method": {"eq": "POST"}}
+        assert result == {"code": 'req.method.eq:"POST"'}
 
     def test_path_uses_contains_not_eq(self):
         result = _build_httpql_filter(path="/admin")
-        assert result == {"path": {"contains": "/admin"}}
+        assert result == {"code": 'req.path.cont:"/admin"'}
 
 
 # --------------------------------------------------------------------------- #
@@ -174,10 +172,7 @@ class TestListRequests:
         assert variables["includeResponseRaw"] is False
         # The composed HTTPQL filter is passed as the `filter` variable.
         assert variables["filter"] == {
-            "and": [
-                {"host": {"eq": "example.com"}},
-                {"method": {"eq": "GET"}},
-            ]
+            "code": 'req.host.cont:"example.com" and req.method.eq:"GET"'
         }
 
     @pytest.mark.asyncio
