@@ -61,6 +61,45 @@ ensure_password() {
     fi
 }
 
+# Install a "skip everything / allow everything" Claude Code profile so the VPS
+# runs non-interactively: no permission prompts, no welcome/theme picker.
+# Source of truth is scripts/claude-vps-settings.json in the repo (kept out of
+# .claude/ so it does NOT affect local dev sessions). We copy it into the
+# user's ~/.claude/settings.json and mark onboarding complete in ~/.claude.json.
+ensure_claude_config() {
+    local src="$ROOT/scripts/claude-vps-settings.json"
+    local dst_dir="$HOME/.claude"
+    local dst="$dst_dir/settings.json"
+    [ -f "$src" ] || { echo "${c_yel}WARN: $src missing — skipping Claude config install${c_rst}"; return 0; }
+    mkdir -p "$dst_dir" 2>/dev/null || true
+    if [ -f "$dst" ] && ! cmp -s "$src" "$dst"; then
+        cp "$dst" "${dst}.bak" 2>/dev/null || true
+        echo "${c_dim}Backed up existing ~/.claude/settings.json → settings.json.bak${c_rst}"
+    fi
+    cp "$src" "$dst" 2>/dev/null || { echo "${c_yel}WARN: failed to write $dst${c_rst}"; return 0; }
+    echo "${c_grn}Installed Claude config → ~/.claude/settings.json (bypassPermissions)${c_rst}"
+
+    # Mark onboarding complete so the welcome flow / theme picker is skipped.
+    # Merge idempotently to preserve any existing keys (numStartups, etc.).
+    local rc=0
+    "$PY" - <<'PY' || rc=$?
+import json, os, pathlib
+p = pathlib.Path(os.path.expanduser("~/.claude.json"))
+try:
+    data = json.loads(p.read_text()) if p.exists() else {}
+except Exception:
+    data = {}
+if not data.get("hasCompletedOnboarding"):
+    data["hasCompletedOnboarding"] = True
+    p.write_text(json.dumps(data, indent=2))
+    print("Marked hasCompletedOnboarding=true in ~/.claude.json")
+PY
+    if [ "$rc" -ne 0 ]; then
+        [ -f "$HOME/.claude.json" ] || printf '{"hasCompletedOnboarding": true}\n' > "$HOME/.claude.json"
+        echo "${c_yel}WARN: could not merge ~/.claude.json via python; wrote minimal file only if absent${c_rst}"
+    fi
+}
+
 is_running() { screen -list 2>/dev/null | grep -q "\.${SCREEN_NAME}\b"; }
 
 show_access() {
@@ -84,7 +123,7 @@ cmd_start() {
             *) echo "unknown flag: $1" >&2; exit 1 ;;
         esac; shift
     done
-    ensure_deps; ensure_password
+    ensure_claude_config; ensure_deps; ensure_password
     export STRIX_WEB_HOST="$HOST" STRIX_WEB_PORT="$PORT"
     if [ "$use_screen" -eq 1 ]; then
         command -v screen >/dev/null || { echo "ERROR: screen not installed." >&2; exit 1; }
