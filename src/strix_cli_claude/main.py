@@ -750,26 +750,18 @@ def check_claude_cli() -> bool:
     return shutil.which("claude") is not None
 
 
-def _write_claude_trust_config(config_dir: str, project_cwd: str) -> str:
-    """Pre-accept the trust + bypass-permissions dialogs so a tty session never blocks.
+def _write_claude_trust_config(project_cwd: str) -> None:
+    """Merge bypass-permissions keys into the real ~/.claude.json and
+    ~/.claude/settings.json so the claude subprocess runs non-interactively.
 
-    CLAUDE_CODE_SKIP_TRUST_DIALOG isn't a real claude CLI env var (confirmed by
-    inspecting the shipped binary - it's silently ignored). The dialogs are only
-    skippable via on-disk config: per-project `hasTrustDialogAccepted` in
-    `.claude.json`, and `skipDangerousModePermissionPrompt` in `settings.json`.
+    On a raw VPS, claude is pre-configured (logged in) in ~/.claude/. We do NOT
+    set CLAUDE_CONFIG_DIR, so claude reads the real config and auth works. We
+    only MERGE bypass keys into the existing files — nothing is copied from
+    another machine, and existing auth/keys are preserved.
 
-    Auth state (OAuth token, account id, etc.) lives in the user's real
-    `~/.claude.json` / `~/.claude/`. Pointing CLAUDE_CONFIG_DIR at a fresh temp
-    dir would lose it and the subprocess would show "Not logged in". So we seed
-    the temp dir's `.claude.json` by merging our bypass keys ON TOP OF a copy of
-    the real `~/.claude.json` (and `.claude/settings.json` if present), so the
-    session stays authenticated while remaining isolated.
-
-    All bypass-related keys are written to BOTH `.claude.json` and `settings.json`
-    (belt-and-suspenders): onboarding/trust state lives in `.claude.json`, while
-    `permissions` + `skipDangerousModePermissionPrompt` are `settings.json`-schema
-    keys. Duplicating them ensures whichever file claude reads from has the full
-    bypass profile, so no prompt can block a non-interactive session.
+    All bypass-related keys are written to BOTH files (belt-and-suspenders):
+    onboarding/trust state lives in .claude.json, while permissions +
+    skipDangerousModePermissionPrompt are settings.json-schema keys.
     """
     _bypass_permissions = {
         "defaultMode": "bypassPermissions",
@@ -780,15 +772,12 @@ def _write_claude_trust_config(config_dir: str, project_cwd: str) -> str:
         "deny": [],
     }
 
-    # Seed `.claude.json` from the user's real config so auth (OAuth token,
-    # account id) is preserved. Fall back to {} if unreadable/absent.
+    # --- Merge into ~/.claude.json (preserves auth, oauthAccount, etc.) ---
     home_claude_json = Path.home() / ".claude.json"
     try:
         claude_data = json.loads(home_claude_json.read_text()) if home_claude_json.exists() else {}
     except Exception:
         claude_data = {}
-
-    # Merge bypass keys without clobbering auth-related keys already present.
     claude_data.update({
         "bypassPermissionsModeAccepted": True,
         "hasCompletedOnboarding": True,
@@ -796,14 +785,12 @@ def _write_claude_trust_config(config_dir: str, project_cwd: str) -> str:
         "model": "opusplan",
         "permissions": _bypass_permissions,
     })
-    # Mark trust accepted for this project; preserve any other trusted projects.
     projects = claude_data.get("projects", {})
     projects[project_cwd] = {"hasTrustDialogAccepted": True, **projects.get(project_cwd, {})}
     claude_data["projects"] = projects
-    Path(config_dir, ".claude.json").write_text(json.dumps(claude_data))
+    home_claude_json.write_text(json.dumps(claude_data))
 
-    # Seed `settings.json` from the user's real ~/.claude/settings.json if
-    # present, then overlay our bypass keys.
+    # --- Merge into ~/.claude/settings.json ---
     home_settings = Path.home() / ".claude" / "settings.json"
     try:
         settings_data = json.loads(home_settings.read_text()) if home_settings.exists() else {}
@@ -814,19 +801,8 @@ def _write_claude_trust_config(config_dir: str, project_cwd: str) -> str:
         "model": "opusplan",
         "permissions": _bypass_permissions,
     })
-    Path(config_dir, "settings.json").write_text(json.dumps(settings_data))
-
-    # Copy credential files from the real ~/.claude/ so the subprocess is
-    # authenticated. On Linux VPS (no keychain) claude stores OAuth/credentials
-    # under ~/.claude/.anthropic/ — without these the session shows
-    # "Not logged in". macOS uses the keychain (unaffected by CLAUDE_CONFIG_DIR),
-    # so this is a no-op there (the dir is empty). dirs_exist_ok=True lets us
-    # overlay without erroring on pre-existing files.
-    src_anthropic = Path.home() / ".claude" / ".anthropic"
-    if src_anthropic.exists():
-        dst_anthropic = Path(config_dir, ".anthropic")
-        shutil.copytree(src_anthropic, dst_anthropic, dirs_exist_ok=True)
-    return config_dir
+    home_settings.parent.mkdir(parents=True, exist_ok=True)
+    home_settings.write_text(json.dumps(settings_data))
 
 
 def clone_github_repo(repo_url: str, target_dir: Path) -> Path:
@@ -1039,8 +1015,8 @@ START PHASE 1 NOW. Fetch the repos first.
         console.print("\n[bold]Starting Claude CLI for org scan...[/bold]\n")
         console.print("=" * 60)
 
-        _write_claude_trust_config(temp_config_dir, temp_config_dir)
-        claude_env = {**os.environ, "IS_SANDBOX": "1", "CLAUDE_CONFIG_DIR": temp_config_dir}
+        _write_claude_trust_config(temp_config_dir)
+        claude_env = {**os.environ, "IS_SANDBOX": "1"}
         claude_base_args = [
             "claude",
             "--mcp-config", str(mcp_config_path),
@@ -1373,8 +1349,8 @@ Then WAIT for the user. Do not call any tool until they tell you what to do.
         console.print("\n[bold]Starting Claude CLI for bounty queue...[/bold]\n")
         console.print("=" * 60)
 
-        _write_claude_trust_config(temp_config_dir, temp_config_dir)
-        claude_env = {**os.environ, "IS_SANDBOX": "1", "CLAUDE_CONFIG_DIR": temp_config_dir}
+        _write_claude_trust_config(temp_config_dir)
+        claude_env = {**os.environ, "IS_SANDBOX": "1"}
         claude_base_args = [
             "claude",
             "--mcp-config", str(mcp_config_path),
@@ -2433,8 +2409,8 @@ For each URL above, call the `download_extension` MCP tool with that URL — it 
             initial_prompt = extension_preamble + initial_prompt
 
         # Common claude args
-        _write_claude_trust_config(temp_config_dir, temp_config_dir)
-        claude_env = {**os.environ, "IS_SANDBOX": "1", "CLAUDE_CONFIG_DIR": temp_config_dir}
+        _write_claude_trust_config(temp_config_dir)
+        claude_env = {**os.environ, "IS_SANDBOX": "1"}
         claude_base_args = [
             "claude",
             "--mcp-config", str(mcp_config_path),
