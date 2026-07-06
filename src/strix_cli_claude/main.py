@@ -502,7 +502,7 @@ DOWNGRADE or REMOVE findings that:
 
 UPGRADE findings that were underrated but have real external impact.
 
-FINAL REPORT FILTER: Only include findings rated MEDIUM severity or above (CVSS >= 4.0) in the final report. Drop all Low and Informational findings entirely — do not mention them.
+FINAL REPORT FILTER: Only include findings rated MEDIUM severity or above (CVSS >= 4.0) in the final report. Drop all Informational findings entirely — do not mention them.
 
 ==============================================================================
 MANDATORY INDEPENDENT VALIDATION (BEFORE calling finish_scan)
@@ -1002,7 +1002,7 @@ PHASE 3: FINAL REPORT
 ==============================================================================
 
 After ALL repos are scanned (not before):
-- REASSESS all findings as an H1 triager: assume the attacker is an external user with NO access to internal systems. Downgrade or remove findings that require internal access, privileged sessions, or have no real external attack path. Upgrade underrated findings with real external impact. Only include MEDIUM+ severity findings (CVSS >= 4.0) in the final report — drop all Low/Informational.
+- REASSESS all findings as an H1 triager: assume the attacker is an external user with NO access to internal systems. Downgrade or remove findings that require internal access, privileged sessions, or have no real external attack path. Upgrade underrated findings with real external impact. Only include MEDIUM+ severity findings (CVSS >= 4.0) in the final report — drop all Informational.
 - Summarize findings across all repos
 - Call finish_scan with a comprehensive executive summary
 - State how many repos were scanned out of the total
@@ -1878,7 +1878,7 @@ PHASE 5: FINAL REPORT
 ==============================================================================
 
 Only after the validation loop completes with 3 clean passes:
-- REASSESS all findings as an H1 triager: assume the attacker is an external user with NO access to internal systems. Downgrade or remove findings that require internal access, privileged sessions, or have no real external attack path. Upgrade underrated findings with real external impact. Only include MEDIUM+ severity findings (CVSS >= 4.0) in the final report — drop all Low/Informational.
+- REASSESS all findings as an H1 triager: assume the attacker is an external user with NO access to internal systems. Downgrade or remove findings that require internal access, privileged sessions, or have no real external attack path. Upgrade underrated findings with real external impact. Only include MEDIUM+ severity findings (CVSS >= 4.0) in the final report — drop all Informational.
 - Summarize total findings
 - Call finish_scan with comprehensive executive summary
 - State: "Completed [X] validation passes. Final 3 passes found 0 new issues."
@@ -1964,7 +1964,7 @@ PHASE 5: FINAL REPORT
 ==============================================================================
 
 Only after 3 clean passes:
-- REASSESS all findings as an H1 triager: assume the attacker is an external user with NO access to internal systems. Downgrade or remove findings that require internal access, privileged sessions, or have no real external attack path. Upgrade underrated findings with real external impact. Only include MEDIUM+ severity findings (CVSS >= 4.0) in the final report — drop all Low/Informational.
+- REASSESS all findings as an H1 triager: assume the attacker is an external user with NO access to internal systems. Downgrade or remove findings that require internal access, privileged sessions, or have no real external attack path. Upgrade underrated findings with real external impact. Only include MEDIUM+ severity findings (CVSS >= 4.0) in the final report — drop all Informational.
 - Call finish_scan with comprehensive executive summary
 - State: "Completed [X] validation passes. Final 3 passes found 0 new issues."
 
