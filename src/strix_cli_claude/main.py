@@ -757,8 +757,13 @@ def _write_claude_trust_config(config_dir: str, project_cwd: str) -> str:
     inspecting the shipped binary - it's silently ignored). The dialogs are only
     skippable via on-disk config: per-project `hasTrustDialogAccepted` in
     `.claude.json`, and `skipDangerousModePermissionPrompt` in `settings.json`.
-    Pointing CLAUDE_CONFIG_DIR at our own temp dir keeps this isolated from the
-    user's real ~/.claude config.
+
+    Auth state (OAuth token, account id, etc.) lives in the user's real
+    `~/.claude.json` / `~/.claude/`. Pointing CLAUDE_CONFIG_DIR at a fresh temp
+    dir would lose it and the subprocess would show "Not logged in". So we seed
+    the temp dir's `.claude.json` by merging our bypass keys ON TOP OF a copy of
+    the real `~/.claude.json` (and `.claude/settings.json` if present), so the
+    session stays authenticated while remaining isolated.
 
     All bypass-related keys are written to BOTH `.claude.json` and `settings.json`
     (belt-and-suspenders): onboarding/trust state lives in `.claude.json`, while
@@ -774,17 +779,53 @@ def _write_claude_trust_config(config_dir: str, project_cwd: str) -> str:
         ],
         "deny": [],
     }
-    Path(config_dir, ".claude.json").write_text(json.dumps({
+
+    # Seed `.claude.json` from the user's real config so auth (OAuth token,
+    # account id) is preserved. Fall back to {} if unreadable/absent.
+    home_claude_json = Path.home() / ".claude.json"
+    try:
+        claude_data = json.loads(home_claude_json.read_text()) if home_claude_json.exists() else {}
+    except Exception:
+        claude_data = {}
+
+    # Merge bypass keys without clobbering auth-related keys already present.
+    claude_data.update({
         "bypassPermissionsModeAccepted": True,
         "hasCompletedOnboarding": True,
         "skipDangerousModePermissionPrompt": True,
+        "model": "opusplan",
         "permissions": _bypass_permissions,
-        "projects": {project_cwd: {"hasTrustDialogAccepted": True}},
-    }))
-    Path(config_dir, "settings.json").write_text(json.dumps({
+    })
+    # Mark trust accepted for this project; preserve any other trusted projects.
+    projects = claude_data.get("projects", {})
+    projects[project_cwd] = {"hasTrustDialogAccepted": True, **projects.get(project_cwd, {})}
+    claude_data["projects"] = projects
+    Path(config_dir, ".claude.json").write_text(json.dumps(claude_data))
+
+    # Seed `settings.json` from the user's real ~/.claude/settings.json if
+    # present, then overlay our bypass keys.
+    home_settings = Path.home() / ".claude" / "settings.json"
+    try:
+        settings_data = json.loads(home_settings.read_text()) if home_settings.exists() else {}
+    except Exception:
+        settings_data = {}
+    settings_data.update({
         "skipDangerousModePermissionPrompt": True,
+        "model": "opusplan",
         "permissions": _bypass_permissions,
-    }))
+    })
+    Path(config_dir, "settings.json").write_text(json.dumps(settings_data))
+
+    # Copy credential files from the real ~/.claude/ so the subprocess is
+    # authenticated. On Linux VPS (no keychain) claude stores OAuth/credentials
+    # under ~/.claude/.anthropic/ — without these the session shows
+    # "Not logged in". macOS uses the keychain (unaffected by CLAUDE_CONFIG_DIR),
+    # so this is a no-op there (the dir is empty). dirs_exist_ok=True lets us
+    # overlay without erroring on pre-existing files.
+    src_anthropic = Path.home() / ".claude" / ".anthropic"
+    if src_anthropic.exists():
+        dst_anthropic = Path(config_dir, ".anthropic")
+        shutil.copytree(src_anthropic, dst_anthropic, dirs_exist_ok=True)
     return config_dir
 
 
