@@ -64,7 +64,11 @@ ensure_password() {
 is_running() { screen -list 2>/dev/null | grep -q "\.${SCREEN_NAME}\b"; }
 
 show_access() {
-    local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    local ip=""
+    # Linux: `hostname -I`. macOS: `ipconfig getifaddr en0`.
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    [ -n "$ip" ] || ip="$(ipconfig getifaddr en0 2>/dev/null || true)"
+    [ -n "$ip" ] || ip="$(ipconfig getifaddr en1 2>/dev/null || true)"
     echo "  Local : http://127.0.0.1:${PORT}"
     [ -n "$ip" ] && echo "  LAN   : http://${ip}:${PORT}"
     echo "  ${c_dim}Password file: ${PW_FILE}${c_rst}"
