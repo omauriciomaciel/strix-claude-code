@@ -759,13 +759,31 @@ def _write_claude_trust_config(config_dir: str, project_cwd: str) -> str:
     `.claude.json`, and `skipDangerousModePermissionPrompt` in `settings.json`.
     Pointing CLAUDE_CONFIG_DIR at our own temp dir keeps this isolated from the
     user's real ~/.claude config.
+
+    All bypass-related keys are written to BOTH `.claude.json` and `settings.json`
+    (belt-and-suspenders): onboarding/trust state lives in `.claude.json`, while
+    `permissions` + `skipDangerousModePermissionPrompt` are `settings.json`-schema
+    keys. Duplicating them ensures whichever file claude reads from has the full
+    bypass profile, so no prompt can block a non-interactive session.
     """
+    _bypass_permissions = {
+        "defaultMode": "bypassPermissions",
+        "allow": [
+            "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep",
+            "WebFetch", "WebSearch", "Task", "TodoWrite", "mcp__*",
+        ],
+        "deny": [],
+    }
     Path(config_dir, ".claude.json").write_text(json.dumps({
         "bypassPermissionsModeAccepted": True,
+        "hasCompletedOnboarding": True,
+        "skipDangerousModePermissionPrompt": True,
+        "permissions": _bypass_permissions,
         "projects": {project_cwd: {"hasTrustDialogAccepted": True}},
     }))
     Path(config_dir, "settings.json").write_text(json.dumps({
         "skipDangerousModePermissionPrompt": True,
+        "permissions": _bypass_permissions,
     }))
     return config_dir
 
@@ -1680,13 +1698,11 @@ docker exec -u pentester -w /workspace {sandbox_info["container_name"]} bash -lc
             wrapper_initial = "START THE SECURITY ASSESSMENT NOW. Execute all phases automatically: reconnaissance, vulnerability testing, and reporting. Do NOT wait for user input. BEGIN IMMEDIATELY."
 
         wrapper_script.write_text(f'''#!/bin/bash
-export CLAUDE_CODE_SKIP_TRUST_DIALOG=1
-export IS_SANDBOX=1
-exec claude \\
+claude \\
     --mcp-config "{mcp_config_path}" \\
-    --append-system-prompt "$(cat "{system_prompt_path}")" \\
     --permission-mode bypassPermissions \\
     --dangerously-skip-permissions \\
+    --append-system-prompt "$(cat "{system_prompt_path}")" \\
     "{wrapper_initial}"
 ''')
         wrapper_script.chmod(0o755)
@@ -2381,9 +2397,9 @@ For each URL above, call the `download_extension` MCP tool with that URL — it 
         claude_base_args = [
             "claude",
             "--mcp-config", str(mcp_config_path),
-            "--append-system-prompt", system_prompt,
             "--permission-mode", "bypassPermissions",
             "--dangerously-skip-permissions",
+            "--append-system-prompt", system_prompt,
         ]
 
         if sys.stdin.isatty():
