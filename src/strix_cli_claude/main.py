@@ -770,7 +770,7 @@ def _write_claude_trust_config(config_dir: str, project_cwd: str) -> str:
         "defaultMode": "bypassPermissions",
         "allow": [
             "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep",
-            "WebFetch", "WebSearch", "Task", "TodoWrite", "mcp__*",
+            "WebFetch", "WebSearch", "Task", "TodoWrite", "mcp__strix-pentest__*",
         ],
         "deny": [],
     }
