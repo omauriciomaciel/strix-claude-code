@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
+from .agent_backend import BACKENDS
 from .extension_downloader import parse_extension_url
 from .github_org import parse_org_from_url
 from .sandbox import Sandbox, SandboxError
@@ -712,8 +713,8 @@ Do NOT modify the .claude/CLAUDE.md file unless explicitly instructed by the use
     return base_prompt
 
 
-def create_mcp_config(container_name: str, scan_id: str, output_file: str, extra_env: dict[str, str] | None = None, caido_url: str | None = None) -> dict[str, Any]:
-    """Create MCP configuration for Claude CLI.
+def create_mcp_config(container_name: str, scan_id: str, output_file: str, extra_env: dict[str, str] | None = None, caido_url: str | None = None, agent: str = "claude") -> dict[str, Any]:
+    """Create MCP configuration for the agent CLI backend.
 
     Args:
         caido_url: base URL of the Caido GraphQL sidecar as reachable from the
@@ -726,7 +727,7 @@ def create_mcp_config(container_name: str, scan_id: str, output_file: str, extra
 
     env = {
         "STRIX_SANDBOX_CONTAINER": container_name,
-        "STRIX_AGENT_ID": f"claude-{scan_id}",
+        "STRIX_AGENT_ID": f"{agent}-{scan_id}",
         "STRIX_REPORT_FILE": output_file,
     }
     if caido_url:
@@ -743,66 +744,6 @@ def create_mcp_config(container_name: str, scan_id: str, output_file: str, extra
             }
         }
     }
-
-
-def check_claude_cli() -> bool:
-    """Check if claude CLI is available."""
-    return shutil.which("claude") is not None
-
-
-def _write_claude_trust_config(project_cwd: str) -> None:
-    """Merge bypass-permissions keys into the real ~/.claude.json and
-    ~/.claude/settings.json so the claude subprocess runs non-interactively.
-
-    On a raw VPS, claude is pre-configured (logged in) in ~/.claude/. We do NOT
-    set CLAUDE_CONFIG_DIR, so claude reads the real config and auth works. We
-    only MERGE bypass keys into the existing files — nothing is copied from
-    another machine, and existing auth/keys are preserved.
-
-    All bypass-related keys are written to BOTH files (belt-and-suspenders):
-    onboarding/trust state lives in .claude.json, while permissions +
-    skipDangerousModePermissionPrompt are settings.json-schema keys.
-    """
-    _bypass_permissions = {
-        "defaultMode": "bypassPermissions",
-        "allow": [
-            "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep",
-            "WebFetch", "WebSearch", "Task", "TodoWrite", "mcp__strix-pentest__*",
-        ],
-        "deny": [],
-    }
-
-    # --- Merge into ~/.claude.json (preserves auth, oauthAccount, etc.) ---
-    home_claude_json = Path.home() / ".claude.json"
-    try:
-        claude_data = json.loads(home_claude_json.read_text()) if home_claude_json.exists() else {}
-    except Exception:
-        claude_data = {}
-    claude_data.update({
-        "bypassPermissionsModeAccepted": True,
-        "hasCompletedOnboarding": True,
-        "skipDangerousModePermissionPrompt": True,
-        "model": "opusplan",
-        "permissions": _bypass_permissions,
-    })
-    projects = claude_data.get("projects", {})
-    projects[project_cwd] = {"hasTrustDialogAccepted": True, **projects.get(project_cwd, {})}
-    claude_data["projects"] = projects
-    home_claude_json.write_text(json.dumps(claude_data))
-
-    # --- Merge into ~/.claude/settings.json ---
-    home_settings = Path.home() / ".claude" / "settings.json"
-    try:
-        settings_data = json.loads(home_settings.read_text()) if home_settings.exists() else {}
-    except Exception:
-        settings_data = {}
-    settings_data.update({
-        "skipDangerousModePermissionPrompt": True,
-        "model": "opusplan",
-        "permissions": _bypass_permissions,
-    })
-    home_settings.parent.mkdir(parents=True, exist_ok=True)
-    home_settings.write_text(json.dumps(settings_data))
 
 
 def clone_github_repo(repo_url: str, target_dir: Path) -> Path:
@@ -852,6 +793,7 @@ def _handle_org_scan(
     image: str | None,
     mount_docker: bool,
     verbose: bool,
+    agent: str = "claude",
 ) -> None:
     """Launch a single Strix sandbox that scans all repos in the org.
 
@@ -913,6 +855,7 @@ def _handle_org_scan(
             output_file,
             extra_env={"STRIX_SCAN_KIND": "org", "STRIX_SESSION_LABEL": f"strix-{sandbox_info['scan_id']}"},
             caido_url=f"http://127.0.0.1:{sandbox_info['caido_port']}",
+            agent=agent,
         )
 
         temp_config_dir = tempfile.mkdtemp(prefix=f"strix-cli-{scan_id}")
@@ -1012,32 +955,21 @@ After ALL repos are scanned (not before):
 START PHASE 1 NOW. Fetch the repos first.
 """
 
-        console.print("\n[bold]Starting Claude CLI for org scan...[/bold]\n")
+        backend = BACKENDS[agent]
+        console.print(f"\n[bold]Starting {backend.name} for org scan...[/bold]\n")
         console.print("=" * 60)
 
-        _write_claude_trust_config(temp_config_dir)
-        claude_env = {**os.environ, "IS_SANDBOX": "1"}
-        claude_base_args = [
-            "claude",
-            "--mcp-config", str(mcp_config_path),
-            "--append-system-prompt", system_prompt,
-            "--permission-mode", "bypassPermissions",
-            "--dangerously-skip-permissions",
-        ]
-
-        if sys.stdin.isatty():
-            result = subprocess.run(
-                claude_base_args + [initial_prompt],
-                cwd=temp_config_dir,
-                env=claude_env,
-            )
-        else:
+        backend.write_trust_config(temp_config_dir)
+        argv, extra_env = backend.build_command(mcp_config, system_prompt, temp_config_dir)
+        agent_env = {**os.environ, "IS_SANDBOX": "1", **extra_env}
+        print_mode = not sys.stdin.isatty()
+        if print_mode:
             console.print(f"\n[bold yellow]No interactive terminal - running in print mode.[/bold yellow]")
-            result = subprocess.run(
-                claude_base_args + ["--print", initial_prompt],
-                cwd=temp_config_dir,
-                env=claude_env,
-            )
+        result = subprocess.run(
+            argv + backend.prompt_args(initial_prompt, print_mode),
+            cwd=temp_config_dir,
+            env=agent_env,
+        )
 
         console.print("\n" + "=" * 60)
         console.print("[bold]Org scan session ended.[/bold]")
@@ -1113,6 +1045,7 @@ def _handle_bounty_session(
     mount_docker: bool,
     keep_container: bool,
     verbose: bool,
+    agent: str = "claude",
 ) -> None:
     """Run Strix in bounty work-queue mode.
 
@@ -1175,6 +1108,7 @@ def _handle_bounty_session(
             output_file,
             extra_env={"STRIX_SCAN_KIND": "bounty", "STRIX_SESSION_LABEL": f"strix-{sandbox_info['scan_id']}"},
             caido_url=f"http://127.0.0.1:{sandbox_info['caido_port']}",
+            agent=agent,
         )
 
         temp_config_dir = tempfile.mkdtemp(prefix=f"strix-bounty-{scan_id}")
@@ -1346,32 +1280,21 @@ state block verbatim):
 Then WAIT for the user. Do not call any tool until they tell you what to do.
 """
 
-        console.print("\n[bold]Starting Claude CLI for bounty queue...[/bold]\n")
+        backend = BACKENDS[agent]
+        console.print(f"\n[bold]Starting {backend.name} for bounty queue...[/bold]\n")
         console.print("=" * 60)
 
-        _write_claude_trust_config(temp_config_dir)
-        claude_env = {**os.environ, "IS_SANDBOX": "1"}
-        claude_base_args = [
-            "claude",
-            "--mcp-config", str(mcp_config_path),
-            "--append-system-prompt", system_prompt,
-            "--permission-mode", "bypassPermissions",
-            "--dangerously-skip-permissions",
-        ]
-
-        if sys.stdin.isatty():
-            subprocess.run(
-                claude_base_args + [initial_prompt],
-                cwd=temp_config_dir,
-                env=claude_env,
-            )
-        else:
+        backend.write_trust_config(temp_config_dir)
+        argv, extra_env = backend.build_command(mcp_config, system_prompt, temp_config_dir)
+        agent_env = {**os.environ, "IS_SANDBOX": "1", **extra_env}
+        print_mode = not sys.stdin.isatty()
+        if print_mode:
             console.print(f"\n[bold yellow]No interactive terminal - running in print mode.[/bold yellow]")
-            subprocess.run(
-                claude_base_args + ["--print", initial_prompt],
-                cwd=temp_config_dir,
-                env=claude_env,
-            )
+        subprocess.run(
+            argv + backend.prompt_args(initial_prompt, print_mode),
+            cwd=temp_config_dir,
+            env=agent_env,
+        )
 
         console.print("\n" + "=" * 60)
         console.print("[bold]Bounty session ended.[/bold]")
@@ -1456,6 +1379,7 @@ def classify_target(target: str) -> dict[str, str]:
 @click.option("--intigriti", "intigriti_alias", is_flag=True, help="Alias for --platform intigriti.")
 @click.option("--program", "bounty_programs", multiple=True, help="(Bounty mode) Limit claims to this program handle. Can be repeated.")
 @click.option("--asset-types", "bounty_asset_types", help="(Bounty mode) Comma-separated asset types to claim (e.g. SOURCE_CODE,URL).")
+@click.option("--agent", type=click.Choice(list(BACKENDS)), default="claude", help="Agent CLI backend to drive the scan.")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def main(
     targets: tuple[str, ...],
@@ -1472,6 +1396,7 @@ def main(
     intigriti_alias: bool,
     bounty_programs: tuple[str, ...],
     bounty_asset_types: str | None,
+    agent: str,
     verbose: bool,
 ):
     """Strix Claude Code - AI-powered penetration testing using Claude CLI.
@@ -1491,14 +1416,16 @@ def main(
         format="%(message)s",
     )
 
-    # Check for claude CLI
-    if not check_claude_cli():
+    # Check for the selected agent CLI
+    backend = BACKENDS[agent]
+    if not backend.check_available():
+        install_hint = (
+            "  npm install -g @anthropic-ai/claude-cli\n\nThen authenticate:\n  claude login"
+            if agent == "claude"
+            else "  npm install -g opencode-ai\n\nThen authenticate:\n  opencode auth login"
+        )
         console.print(Panel(
-            "[red]Claude CLI not found![/red]\n\n"
-            "Please install Claude CLI first:\n"
-            "  npm install -g @anthropic-ai/claude-cli\n\n"
-            "Then authenticate:\n"
-            "  claude login",
+            f"[red]{agent} CLI not found![/red]\n\nPlease install it first:\n{install_hint}",
             title="Error",
         ))
         sys.exit(1)
@@ -1538,6 +1465,7 @@ def main(
             mount_docker=mount_docker,
             keep_container=keep_container,
             verbose=verbose,
+            agent=agent,
         )
         return
 
@@ -1558,6 +1486,7 @@ def main(
             image=image,
             mount_docker=mount_docker,
             verbose=verbose,
+            agent=agent,
         )
         return
 
@@ -1676,6 +1605,7 @@ def main(
             output_file,
             extra_env={"STRIX_SCAN_KIND": "single", "STRIX_SESSION_LABEL": f"strix-{sandbox_info['scan_id']}"},
             caido_url=f"http://127.0.0.1:{sandbox_info['caido_port']}",
+            agent=agent,
         )
 
         # Write MCP config to temp file
@@ -1698,7 +1628,7 @@ docker exec -u pentester -w /workspace {sandbox_info["container_name"]} bash -lc
         target_info = "\n".join(target_descriptions)
         system_prompt = get_system_prompt(target_info, scan_mode, sandbox_info["cpu_count"], instruction, output_file, mount_docker)
 
-        console.print("\n[bold]Starting Claude CLI...[/bold]\n")
+        console.print(f"\n[bold]Starting {agent}...[/bold]\n")
         console.print("=" * 60)
 
         # Write system prompt to file
@@ -2408,30 +2338,19 @@ For each URL above, call the `download_extension` MCP tool with that URL — it 
 """
             initial_prompt = extension_preamble + initial_prompt
 
-        # Common claude args
-        _write_claude_trust_config(temp_config_dir)
-        claude_env = {**os.environ, "IS_SANDBOX": "1"}
-        claude_base_args = [
-            "claude",
-            "--mcp-config", str(mcp_config_path),
-            "--permission-mode", "bypassPermissions",
-            "--dangerously-skip-permissions",
-            "--append-system-prompt", system_prompt,
-        ]
-
-        if sys.stdin.isatty():
-            result = subprocess.run(
-                claude_base_args + [initial_prompt],
-                cwd=temp_config_dir,
-                env=claude_env,
-            )
-        else:
+        # Common agent backend args
+        backend = BACKENDS[agent]
+        backend.write_trust_config(temp_config_dir)
+        argv, extra_env = backend.build_command(mcp_config, system_prompt, temp_config_dir)
+        agent_env = {**os.environ, "IS_SANDBOX": "1", **extra_env}
+        print_mode = not sys.stdin.isatty()
+        if print_mode:
             console.print(f"\n[bold yellow]No interactive terminal - running in print mode.[/bold yellow]")
-            result = subprocess.run(
-                claude_base_args + ["--print", initial_prompt],
-                cwd=temp_config_dir,
-                env=claude_env,
-            )
+        result = subprocess.run(
+            argv + backend.prompt_args(initial_prompt, print_mode),
+            cwd=temp_config_dir,
+            env=agent_env,
+        )
 
         console.print("\n" + "=" * 60)
         console.print("[bold]Scan session ended.[/bold]")
