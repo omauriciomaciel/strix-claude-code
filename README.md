@@ -15,12 +15,19 @@ Strix Claude Code provides:
 ## Prerequisites
 
 1. **Docker**: Install and run Docker Desktop
-2. **Claude Code CLI**: Install and authenticate
-   ```bash
-   npm install -g @anthropic-ai/claude-code
-   claude login
-   ```
-   Tested with Claude Code `2.x`. Check with `claude --version`.
+2. **An agent CLI backend** — install at least one:
+   - **Claude Code CLI** (default, `--agent claude`)
+     ```bash
+     npm install -g @anthropic-ai/claude-code
+     claude login
+     ```
+     Tested with Claude Code `2.x`. Check with `claude --version`.
+   - **opencode CLI** (`--agent opencode`)
+     ```bash
+     npm install -g opencode-ai
+     opencode auth login
+     ```
+     Check with `opencode --version`.
 3. **Python 3.11+**: Required for the wrapper
 4. **screen**: Required for TUI (usually pre-installed on Linux/macOS)
    ```bash
@@ -173,6 +180,9 @@ strix-claude-cli -t https://example.com -m quick
 
 # Standard scan with custom instructions
 strix-claude-cli -t https://example.com -m standard --instruction "Focus on authentication bypass"
+
+# Run with the opencode CLI backend instead of Claude Code
+strix-claude-cli -t https://example.com --agent opencode
 ```
 
 ### Options
@@ -185,6 +195,7 @@ strix-claude-cli -t https://example.com -m standard --instruction "Focus on auth
 --instruction-file    File containing custom instructions
 --image               Custom Docker sandbox image
 --keep-container      Keep container running after scan
+--agent                Agent CLI backend to drive the scan: claude, opencode (default: claude)
 -v, --verbose         Verbose output
 ```
 
@@ -213,8 +224,8 @@ strix-claude-cli -t https://github.com/user/repo -m deep
 
 1. **Sandbox Setup**: Starts a Docker container with Kali Linux and security tools
 2. **MCP Server**: Exposes penetration testing tools via Model Context Protocol
-3. **Claude CLI**: Runs Claude with the MCP tools and pen testing system prompt
-4. **Interactive Session**: You interact with Claude, which uses the tools autonomously
+3. **Agent CLI**: Runs the selected agent backend (Claude Code or opencode, via `--agent`) with the MCP tools and pen testing system prompt
+4. **Interactive Session**: You interact with the agent, which uses the tools autonomously
 
 ## Available Tools
 
@@ -305,7 +316,10 @@ Sandbox stopped.
 Make sure Docker Desktop is installed and running.
 
 ### Claude CLI not found
-Install with: `npm install -g @anthropic-ai/claude-cli`
+Install with: `npm install -g @anthropic-ai/claude-code`
+
+### opencode CLI not found
+Install with: `npm install -g opencode-ai`, then `opencode auth login`
 
 ### Container fails to start
 Check if the strix sandbox image is available:
