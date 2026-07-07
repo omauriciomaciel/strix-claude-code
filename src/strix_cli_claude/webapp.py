@@ -49,6 +49,7 @@ from strix_cli_claude import db, scan_manager, verifier
 
 STATIC_DIR = Path(__file__).parent / "web_static"
 SELF_SCREEN = os.getenv("STRIX_WEB_SELF_SCREEN", "strix-app")
+DEFAULT_AGENT = os.getenv("STRIX_WEB_DEFAULT_AGENT", "claude")
 
 # --------------------------------------------------------------------------- #
 # Auth
@@ -677,8 +678,8 @@ display:flex;align-items:center;justify-content:center;border:1px solid var(--te
     </div>
     <label>Agent</label>
     <div class=seg>
-     <label><input type=radio name=agent value=claude checked><span>claude</span></label>
-     <label><input type=radio name=agent value=opencode><span>opencode</span></label>
+     <label><input type=radio name=agent value=claude """ + ("checked" if DEFAULT_AGENT == "claude" else "") + """><span>claude</span></label>
+     <label><input type=radio name=agent value=opencode """ + ("checked" if DEFAULT_AGENT == "opencode" else "") + """><span>opencode</span></label>
     </div>
     <label>Instruction (optional)</label>
     <input name=instruction placeholder="e.g. focus on auth and IDOR">
@@ -1254,7 +1255,7 @@ async def api_launch(request: Request):
             targets=targets,
             scan_mode=form.get("scan_mode", "deep"),
             instruction=form.get("instruction") or None,
-            agent=form.get("agent", "claude"),
+            agent=form.get("agent", DEFAULT_AGENT),
         )
     except Exception as e:
         return PlainTextResponse(f"start failed: {e}", status_code=500)

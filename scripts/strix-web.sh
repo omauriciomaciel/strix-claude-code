@@ -7,9 +7,9 @@
 # control panel. It does NOT change any CLI behaviour.
 #
 # Usage:
-#   scripts/strix-web.sh start [--screen] [--port N] [--host H]
+#   scripts/strix-web.sh start [--screen] [--port N] [--host H] [--agent claude|opencode]
 #   scripts/strix-web.sh stop
-#   scripts/strix-web.sh restart [--screen] [--port N] [--host H]
+#   scripts/strix-web.sh restart [--screen] [--port N] [--host H] [--agent claude|opencode]
 #   scripts/strix-web.sh status
 #   scripts/strix-web.sh logs
 #   scripts/strix-web.sh set-password [NEW_PASSWORD]
@@ -20,8 +20,10 @@
 #     in a `screen` session named "strix-app" (survives logout).
 #   * First run creates the password file with the default password "changeme".
 #     CHANGE IT before exposing the port. See `set-password`.
+#   * `--agent` only pre-selects the default agent CLI backend (claude/opencode)
+#     in the dashboard's "Launch scan" form — it does not start a scan itself.
 #   * Env overrides: STRIX_WEB_PORT, STRIX_WEB_HOST, STRIX_WEB_PASSWORD (overrides
-#     the file), STRIX_WEB_SCREEN (screen session name).
+#     the file), STRIX_WEB_SCREEN (screen session name), STRIX_WEB_DEFAULT_AGENT.
 #
 set -euo pipefail
 
@@ -31,6 +33,7 @@ cd "$ROOT"
 SCREEN_NAME="${STRIX_WEB_SCREEN:-strix-app}"
 HOST="${STRIX_WEB_HOST:-0.0.0.0}"
 PORT="${STRIX_WEB_PORT:-8800}"
+AGENT="${STRIX_WEB_DEFAULT_AGENT:-claude}"
 PW_FILE="$HOME/.strix/web_password"
 LOG="$HOME/.strix/web_app.log"
 
@@ -81,16 +84,22 @@ cmd_start() {
             --screen) use_screen=1 ;;
             --port) PORT="$2"; shift ;;
             --host) HOST="$2"; shift ;;
+            --agent)
+                case "$2" in
+                    claude|opencode) ;;
+                    *) echo "invalid --agent: $2 (expected claude or opencode)" >&2; exit 1 ;;
+                esac
+                AGENT="$2"; shift ;;
             *) echo "unknown flag: $1" >&2; exit 1 ;;
         esac; shift
     done
     ensure_deps; ensure_password
-    export STRIX_WEB_HOST="$HOST" STRIX_WEB_PORT="$PORT"
+    export STRIX_WEB_HOST="$HOST" STRIX_WEB_PORT="$PORT" STRIX_WEB_DEFAULT_AGENT="$AGENT"
     if [ "$use_screen" -eq 1 ]; then
         command -v screen >/dev/null || { echo "ERROR: screen not installed." >&2; exit 1; }
         if is_running; then echo "Already running in screen '${SCREEN_NAME}'. Use 'restart'."; exit 0; fi
         screen -L -Logfile "$LOG" -dmS "$SCREEN_NAME" \
-            bash -lc "cd '$ROOT' && exec env STRIX_WEB_HOST='$HOST' STRIX_WEB_PORT='$PORT' '$PY' -m strix_cli_claude.webapp"
+            bash -lc "cd '$ROOT' && exec env STRIX_WEB_HOST='$HOST' STRIX_WEB_PORT='$PORT' STRIX_WEB_DEFAULT_AGENT='$AGENT' '$PY' -m strix_cli_claude.webapp"
         sleep 1
         echo "${c_grn}Started in screen '${SCREEN_NAME}'.${c_rst}"
         show_access

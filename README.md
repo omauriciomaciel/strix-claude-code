@@ -105,6 +105,10 @@ scripts/strix-web.sh start
 # Detached in a screen session named "strix-app" (survives logout)
 scripts/strix-web.sh start --screen
 
+# Pre-select the default agent CLI backend in the "Launch scan" form
+# (does not start a scan itself — the form still launches scans)
+scripts/strix-web.sh start --agent opencode
+
 # Manage it
 scripts/strix-web.sh status
 scripts/strix-web.sh logs
@@ -154,6 +158,7 @@ Password changes apply **immediately** — no restart needed (it is re-read per 
 | `STRIX_WEB_PORT`     | `8800`      | Port                                                           |
 | `STRIX_WEB_PASSWORD` | *(unset)*   | Overrides the password file                                    |
 | `STRIX_WEB_SCREEN`   | `strix-app` | Launcher's screen name; this session is hidden from the list   |
+| `STRIX_WEB_DEFAULT_AGENT` | `claude` | Pre-selects the agent backend (claude/opencode) in the launch form |
 
 ### Install as a phone app (PWA)
 
