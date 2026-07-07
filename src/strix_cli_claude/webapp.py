@@ -675,6 +675,11 @@ display:flex;align-items:center;justify-content:center;border:1px solid var(--te
      <label><input type=radio name=scan_mode value=standard><span>standard</span></label>
      <label><input type=radio name=scan_mode value=quick><span>quick</span></label>
     </div>
+    <label>Agent</label>
+    <div class=seg>
+     <label><input type=radio name=agent value=claude checked><span>claude</span></label>
+     <label><input type=radio name=agent value=opencode><span>opencode</span></label>
+    </div>
     <label>Instruction (optional)</label>
     <input name=instruction placeholder="e.g. focus on auth and IDOR">
     <button type=submit>""" + _ICO_LAUNCH + """Start scan</button>
@@ -1249,6 +1254,7 @@ async def api_launch(request: Request):
             targets=targets,
             scan_mode=form.get("scan_mode", "deep"),
             instruction=form.get("instruction") or None,
+            agent=form.get("agent", "claude"),
         )
     except Exception as e:
         return PlainTextResponse(f"start failed: {e}", status_code=500)

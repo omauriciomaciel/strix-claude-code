@@ -56,9 +56,9 @@ strix-claude-tui
 ```
 
 This launches an interactive dashboard where you can:
-- Start new scans with a guided wizard
+- Start new scans with a guided wizard, choosing the scan mode and the agent CLI backend (Claude Code or opencode)
 - View all running and completed scans
-- Attach to running scans to watch Claude work
+- Attach to running scans to watch the agent work
 - View scan logs and details
 - Stop or delete scans
 
@@ -82,7 +82,9 @@ An optional, installable web dashboard for monitoring and controlling your hunte
 sessions from a phone or any browser. It shows your **running `screen` sessions**
 (live, straight from `screen -list`) and **latest findings** (from
 `~/.strix/strix.db`), and lets you peek into any session, send commands to it,
-stop it, triage findings (confirm/reject), and launch new scans.
+stop it, triage findings (confirm/reject), and launch new scans. The launch
+form lets you pick the scan mode and the agent CLI backend (Claude Code or
+opencode), same as the `--agent` flag on the CLI.
 
 > **Additive & safe** — it only *reads* the existing sessions/DB and shells out to
 > the same `screen` commands. It does not change any CLI behaviour. Installing or

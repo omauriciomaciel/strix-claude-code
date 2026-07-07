@@ -127,6 +127,7 @@ def start_scan(
     instruction: str | None = None,
     output_file: str | None = None,
     mount_docker: bool = False,
+    agent: str = "claude",
 ) -> dict[str, Any]:
     """Start a new scan in a detached screen session.
 
@@ -136,6 +137,7 @@ def start_scan(
         instruction: Custom instructions for the scan
         output_file: Path to save the report
         mount_docker: Mount Docker socket for container scanning
+        agent: Agent CLI backend to drive the scan (claude, opencode)
     """
     import secrets
 
@@ -155,6 +157,7 @@ def start_scan(
         "-m", scan_mode,
         "-o", output_file,
         "--scan-id", scan_id,
+        "--agent", agent,
     ]
 
     for target in targets:
@@ -215,6 +218,7 @@ read
         "output_file": output_file,
         "log_file": str(log_file),
         "mount_docker": mount_docker,
+        "agent": agent,
         "started_at": datetime.now().isoformat(),
         "screen_name": f"strix-{scan_id}",
     }

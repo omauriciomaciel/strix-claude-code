@@ -638,6 +638,24 @@ def new_scan_wizard():
     )
     console.print()
 
+    # Agent CLI backend selection
+    console.print("[dim]Select agent CLI backend:[/dim]")
+    console.print()
+    agent_table = Table(box=None, show_header=False, padding=(0, 2))
+    agent_table.add_column("Agent", style="cyan")
+    agent_table.add_column("Description", style="dim")
+    agent_table.add_row("[bold]claude[/bold]", "Claude Code CLI (default)")
+    agent_table.add_row("opencode", "opencode CLI")
+    console.print(agent_table)
+    console.print()
+
+    agent = Prompt.ask(
+        "Agent",
+        choices=["claude", "opencode"],
+        default="claude"
+    )
+    console.print()
+
     # Custom instruction
     instruction = Prompt.ask(
         "Custom instruction [dim](optional)[/dim]",
@@ -673,6 +691,7 @@ def new_scan_wizard():
 
     mode_color = "red bold" if scan_mode == "deep" else "yellow" if scan_mode == "standard" else "dim"
     summary.add_row("Mode", f"[{mode_color}]{scan_mode.upper()}[/{mode_color}]")
+    summary.add_row("Agent", agent)
     summary.add_row("Instructions", instruction or "[dim]None[/dim]")
     summary.add_row("Docker Socket", "[green]Yes[/green]" if mount_docker else "[dim]No[/dim]")
     summary.add_row("Report", f"[cyan]{output_file}[/cyan]")
@@ -700,6 +719,7 @@ def new_scan_wizard():
             instruction=instruction,
             output_file=output_file,
             mount_docker=mount_docker,
+            agent=agent,
         )
 
     # Success message
